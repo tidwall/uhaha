@@ -1,5 +1,5 @@
 <p align="center">
-	<img src="logo.png" border=0 height="210" alt="uhaha">
+	<img src="logo.png" border=0 height=180 alt="uhaha">
 </p>
 <p align="center">High Availabilty Framework for Happy Data</p>
 
