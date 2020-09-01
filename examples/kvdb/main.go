@@ -8,6 +8,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +38,7 @@ func main() {
 	conf.AddReadCommand("keys", cmdKEYS)
 	conf.AddReadCommand("dbsize", cmdDBSIZE)
 	conf.AddPassiveCommand("monitor", cmdMONITOR)
+	conf.AddPassiveCommand("setrandquote", cmdSETRANDQUOTE)
 
 	uhaha.Main(conf)
 }
@@ -147,6 +151,48 @@ func cmdSET(m uhaha.Machine, args []string) (interface{}, error) {
 	}
 	db.set(o)
 	return redcon.SimpleString("OK"), nil
+}
+
+var quoteURLS = []string{
+	"https://gist.githubusercontent.com/tidwall/22140b7dd4e13f284c8c2663287178a0/raw/4d707b74de37f33da59b0b2e01c4d322e99dbc18/quote1.txt",
+	"https://gist.githubusercontent.com/tidwall/ed62f7d7f429163af09c4904d42db20c/raw/00edea8e6988184050ab9bc6e43e743da070a19a/quote2.txt",
+	"https://gist.githubusercontent.com/tidwall/ecc422812fcd50bfb571705de5f115eb/raw/9f0194a508154f80747bc860beba1d81e214664f/quote3.txt",
+	"https://gist.githubusercontent.com/tidwall/231779f2a54e5fa956849c9376c78f6b/raw/44fa40e2f0cd81401f97b918ebe8f24d7eb59272/quote4.txt",
+}
+
+// SETRANDQUOTE key
+// help: sets the key to a random quote
+func cmdSETRANDQUOTE(m uhaha.Machine, args []string) (interface{}, error) {
+	// This is running as a passive command, and we intend to translate the
+	// arguments using the FilterArgs() type.
+	//
+	// Here we use the standard math/rand package instead of Machine.Rand and
+	// download a random quote using the Go http client.
+	if len(args) != 2 {
+		return nil, uhaha.ErrWrongNumArgs
+	}
+
+	// Generate the random url.
+	url := quoteURLS[rand.Int()%len(quoteURLS)]
+
+	// Download the quote
+	resp, err := http.DefaultClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	value, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status: %d\n%s", resp.StatusCode, value)
+	}
+
+	// Filter the args to make a new SET command that includes the quote
+	args = []string{"SET", args[1], string(value)}
+
+	return uhaha.FilterArgs(args), nil
 }
 
 func (o *object) exkey() string {

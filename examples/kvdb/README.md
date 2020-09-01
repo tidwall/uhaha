@@ -4,7 +4,7 @@ A fault-tolerant key value database using the
 [Uhaha](https://github.com/tidwall/uhaha) framework
 
 This is an example utilizing some of the most important Uhaha features, such as
-the tick callback, read/write/passive commands, and binary snapshots.
+the tick callback, read/write/passive commands, argument filtering, and binary snapshots.
 
 ## Commands
 
@@ -15,6 +15,7 @@ GET key
 KEYS pattern
 DBSIZE
 MONITOR
+SETRANDQUOTE key
 ```
 
 ## Building
