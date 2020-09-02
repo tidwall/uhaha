@@ -325,6 +325,7 @@ func confInit(conf *Config) {
 func (conf *Config) addCommand(kind byte, name string,
 	fn func(m Machine, args []string) (interface{}, error),
 ) {
+	name = strings.ToLower(name)
 	if conf.cmds == nil {
 		conf.cmds = make(map[string]command)
 	}
