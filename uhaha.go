@@ -1549,13 +1549,12 @@ func (m *machine) Uint64() uint64 {
 }
 
 func (m *machine) Float64() float64 {
-	m.rseed()
-again:
-	f := float64(m.Uint64()) / math.MaxUint64
-	if f == 1 {
-		goto again
+	for {
+		f := float64(m.Uint64()) / math.MaxUint64
+		if f != 1 {
+			return f
+		}
 	}
-	return 0
 }
 
 func (m *machine) Read(p []byte) (n int, err error) {
