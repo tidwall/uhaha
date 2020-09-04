@@ -16,7 +16,7 @@ require (
 	github.com/tidwall/redcon v1.3.2
 	github.com/tidwall/redlog v2.0.0+incompatible
 	github.com/tidwall/rhh v1.1.0
-	github.com/tidwall/rtime v0.1.0
+	github.com/tidwall/rtime v0.1.2
 	github.com/tidwall/sds v0.1.0
 	github.com/tidwall/tinybtree v1.0.1
 	golang.org/x/crypto v0.0.0-20200820211705-5c72a883971a // indirect
