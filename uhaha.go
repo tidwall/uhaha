@@ -1589,6 +1589,30 @@ func (m *machine) Now() time.Time {
 	return time.Unix(0, ts).UTC()
 }
 
+// RawMachineInfo represents the raw components of the machine
+type RawMachineInfo struct {
+	TS   int64
+	Seed int64
+}
+
+// ReadRawMachineInfo reads the raw machine components.
+func ReadRawMachineInfo(m Machine, info *RawMachineInfo) {
+	*info = RawMachineInfo{}
+	if m, ok := m.(*machine); ok {
+		info.TS = m.ts
+		info.Seed = m.seed
+	}
+}
+
+// WriteRawMachineInfo writes raw components to the machine. Use with care as
+// this operation may destroy the consistency of your cluster.
+func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
+	if m, ok := m.(*machine); ok {
+		m.ts = info.TS
+		m.seed = info.Seed
+	}
+}
+
 // TICK timestamp-int64 random-int64
 // help: updates the machine timestamp and random seed. It's not possible to
 //       directly call this from a client service. It can only be called by
@@ -1611,6 +1635,7 @@ func cmdTICK(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
 	if seed == m.seed {
 		return nil, errors.New("random number has not changed")
 	}
+	m.seed = seed
 	m.ts = ts
 	if m.start == 0 {
 		m.start = m.ts

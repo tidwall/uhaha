@@ -11,6 +11,7 @@ require (
 	github.com/hashicorp/raft v1.1.2
 	github.com/hashicorp/raft-boltdb v0.0.0-20191021154308-4207f1bf0617
 	github.com/syndtr/goleveldb v1.0.0 // indirect
+	github.com/tidwall/gjson v1.6.1
 	github.com/tidwall/match v1.0.1
 	github.com/tidwall/raft-leveldb v0.1.0
 	github.com/tidwall/redcon v1.3.2
