@@ -2347,22 +2347,20 @@ func (s *service) execOpenRead(cmd command, args []string,
 
 func (s *service) execNonOpenRead(cmd command, args []string,
 ) (interface{}, error) {
-	// Non-open reads can only be performed on the leader that has received
+	// Non-open reads can only be performed on a leader that has received
 	// a tick response. In this case a tick acts as a write barrier ensuring
-	// that reads will always follow.
+	// that any read command will always follow the tick.
 	s.m.mu.RLock()
-	defer s.m.mu.RUnlock()
+	atomic.AddInt32(&s.m.readers, 1)
+	defer func() {
+		atomic.AddInt32(&s.m.readers, -1)
+		s.m.mu.RUnlock()
+	}()
 	if s.ra.State() != raft.Leader || s.m.tickedIndex == 0 {
 		return nil, raft.ErrNotLeader
 	}
 	// We are the leader and we have received a tick event.
 	// Complete the read command.
-	// Set the machine to read access mode
-	atomic.AddInt32(&s.m.readers, 1)
-	defer func() {
-		// Return the machine to write access mode
-		atomic.AddInt32(&s.m.readers, -1)
-	}()
 	return cmd.fn(s.m, s.ra, args)
 }
 
