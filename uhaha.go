@@ -565,7 +565,6 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 	m.tickedSig = sync.NewCond(&m.mu)
 	m.created = time.Now().UnixNano()
 	m.wrC = make(chan *writeRequestFuture, 1024)
-	m.access = 'w'
 	m.tickDelay = conf.TickDelay
 	m.openReads = conf.OpenReads
 	if rdata != nil {
@@ -1427,7 +1426,7 @@ type machine struct {
 	mu           sync.RWMutex // protect all things in group
 	firstIndex   uint64       // first applied index
 	appliedIndex uint64       // last applied index (stable state)
-	access       int32        // (atomic byte) access mode: r=read, w=write
+	readers      int32        // (atomic counter) number of current readers
 	tickedIndex  uint64       // index of last tick
 	tickedTerm   uint64       // term of last tick
 	tickedSig    *sync.Cond   // signal when ticked
@@ -1528,7 +1527,7 @@ func (m *machine) Rand() Rand {
 func (m *machine) Uint32() uint32 {
 	seed := rincr(m.seed)
 	x := rgen(seed)
-	if atomic.LoadInt32(&m.access) == 'w' {
+	if atomic.LoadInt32(&m.readers) == 0 {
 		m.seed = seed
 	}
 	return x
@@ -1561,7 +1560,7 @@ func (m *machine) Read(p []byte) (n int, err error) {
 			p[i] = last[i]
 		}
 	}
-	if atomic.LoadInt32(&m.access) == 'w' {
+	if atomic.LoadInt32(&m.readers) == 0 {
 		m.seed = seed
 	}
 	return len(p), nil
@@ -1578,17 +1577,17 @@ type Rand interface {
 
 func (m *machine) Now() time.Time {
 	ts := m.ts
-	if atomic.LoadInt32(&m.access) == 'w' {
+	if atomic.LoadInt32(&m.readers) == 0 {
 		m.ts++
 	}
 	return time.Unix(0, ts).UTC()
-
 }
 
 // #region mulberry32
 
 // This is a weirdly good prng. I'm using this so that I can support interop
-// apps on older archs and limited languages, like 32-bit OSs and Javascript.
+// apps on smaller archs and limited languages, like 32-bit OSs and Javascript.
+// The original C code is from:
 // https://gist.github.com/tommyettinger/46a874533244883189143505d203312c
 
 // rgen generates a random uint32. This is basically a port of the next() C
@@ -1601,7 +1600,7 @@ func rgen(seed uint32) uint32 {
 	return z ^ (z >> 14)
 }
 
-// rincr increments the seed prior to using in rgen32
+// rincr increments the seed prior to using in rgen
 func rincr(seed uint32) uint32 {
 	return seed + 0x6D2B79F5
 }
@@ -2337,10 +2336,10 @@ func (s *service) execOpenRead(cmd command, args []string,
 	}
 	// Set the machine to read access mode
 	s.m.mu.RLock()
-	atomic.StoreInt32(&s.m.access, 'r')
+	atomic.AddInt32(&s.m.readers, 1)
 	defer func() {
 		// Return the machine to write access mode
-		atomic.StoreInt32(&s.m.access, 'w')
+		atomic.AddInt32(&s.m.readers, -1)
 		s.m.mu.RUnlock()
 	}()
 	return cmd.fn(s.m, s.ra, args)
@@ -2359,10 +2358,10 @@ func (s *service) execNonOpenRead(cmd command, args []string,
 	// We are the leader and we have received a tick event.
 	// Complete the read command.
 	// Set the machine to read access mode
-	atomic.StoreInt32(&s.m.access, 'r')
+	atomic.AddInt32(&s.m.readers, 1)
 	defer func() {
 		// Return the machine to write access mode
-		atomic.StoreInt32(&s.m.access, 'w')
+		atomic.AddInt32(&s.m.readers, -1)
 	}()
 	return cmd.fn(s.m, s.ra, args)
 }
