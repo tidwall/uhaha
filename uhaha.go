@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,7 +27,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgryski/go-pcgr"
 	"github.com/golang/snappy"
 	"github.com/gomodule/redigo/redis"
 	"github.com/hashicorp/go-hclog"
@@ -454,7 +452,7 @@ func stateChangeFilter(line string, log *redlog.Logger) string {
 type restoreData struct {
 	data  interface{}
 	ts    int64
-	seed  int64
+	seed  uint32
 	start int64
 }
 
@@ -632,8 +630,6 @@ func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
 	var once int32
 	wg.Add(1)
 	go func() {
-		var rng pcgr.Rand
-		rng.Seed(time.Now().UnixNano())
 		for {
 			tm := rtime.Now()
 			if tm.IsZero() {
@@ -989,13 +985,13 @@ func runTicker(conf Config, rt *remoteTime, m *machine, ra *raft.Raft,
 			}
 			rnb = rbuf[:]
 		}
-		seed := int64(binary.LittleEndian.Uint64(rnb))
-		rnb = rnb[8:]
+		seed := binary.LittleEndian.Uint32(rnb)
+		rnb = rnb[4:]
 		req := new(writeRequestFuture)
 		req.args = []string{
 			"tick",
 			strconv.FormatInt(ts, 10),
-			strconv.FormatInt(seed, 10),
+			strconv.FormatUint(uint64(seed), 10),
 		}
 		req.wg.Add(1)
 		m.wrC <- req
@@ -1275,7 +1271,7 @@ func (m *machine) Snapshot() (raft.FSMSnapshot, error) {
 	return snap, nil
 }
 
-func readSnapHead(r io.Reader) (start, ts, seed int64, err error) {
+func readSnapHead(r io.Reader) (start, ts int64, seed uint32, err error) {
 	var head [32]byte
 	n, err := io.ReadFull(r, head[:])
 	if err != nil {
@@ -1289,7 +1285,7 @@ func readSnapHead(r io.Reader) (start, ts, seed int64, err error) {
 	}
 	start = int64(binary.LittleEndian.Uint64(head[8:]))
 	ts = int64(binary.LittleEndian.Uint64(head[16:]))
-	seed = int64(binary.LittleEndian.Uint64(head[24:]))
+	seed = uint32(binary.LittleEndian.Uint64(head[24:]))
 	return start, ts, seed, nil
 }
 
@@ -1330,7 +1326,7 @@ type fsmSnap struct {
 	dir   string
 	snap  Snapshot
 	ts    int64
-	seed  int64
+	seed  uint32
 	start int64
 }
 
@@ -1429,7 +1425,6 @@ type machine struct {
 	tickDelay time.Duration      // ticker delay
 
 	mu           sync.RWMutex // protect all things in group
-	prng         pcgr.Rand    // stable prng
 	firstIndex   uint64       // first applied index
 	appliedIndex uint64       // last applied index (stable state)
 	access       int32        // (atomic byte) access mode: r=read, w=write
@@ -1442,7 +1437,7 @@ type machine struct {
 	snap         bool         // snapshot in progress
 	start        int64        // !! PERSISTED !! first non-zero timestamp
 	ts           int64        // !! PERSISTED !! current timestamp
-	seed         int64        // !! PERSISTED !! current seed
+	seed         uint32       // !! PERSISTED !! current seed
 	data         interface{}  // !! PERSISTED !! user data
 
 	wrC chan *writeRequestFuture
@@ -1530,45 +1525,44 @@ func (m *machine) Rand() Rand {
 	return m
 }
 
-func (m *machine) rseed() {
-	seed := m.seed
+func (m *machine) Uint32() uint32 {
+	seed := rincr(m.seed)
+	x := rgen(seed)
 	if atomic.LoadInt32(&m.access) == 'w' {
-		m.seed++
+		m.seed = seed
 	}
-	m.prng.Seed(seed)
-}
-
-func (m *machine) Int() int {
-	m.rseed()
-	return int(m.Uint64() << 1 >> 1)
+	return x
 }
 
 func (m *machine) Uint64() uint64 {
-	m.rseed()
-	return uint64(m.prng.Next())<<32 | uint64(m.prng.Next())
+	return (uint64(m.Uint32()) << 32) | uint64(m.Uint32())
+}
+
+func (m *machine) Int() int {
+	return int(m.Uint64() << 1 >> 1)
 }
 
 func (m *machine) Float64() float64 {
-	for {
-		f := float64(m.Uint64()) / math.MaxUint64
-		if f != 1 {
-			return f
-		}
-	}
+	return float64(m.Uint32()) / 4294967296.0
 }
 
 func (m *machine) Read(p []byte) (n int, err error) {
-	m.rseed()
+	seed := m.seed
 	for len(p) >= 4 {
-		binary.LittleEndian.PutUint32(p, m.prng.Next())
+		seed = rincr(seed)
+		binary.LittleEndian.PutUint32(p, rgen(seed))
 		p = p[4:]
 	}
 	if len(p) > 0 {
 		var last [4]byte
-		binary.LittleEndian.PutUint32(last[:], m.prng.Next())
+		seed = rincr(seed)
+		binary.LittleEndian.PutUint32(last[:], rgen(seed))
 		for i := 0; i < len(p); i++ {
 			p[i] = last[i]
 		}
+	}
+	if atomic.LoadInt32(&m.access) == 'w' {
+		m.seed = seed
 	}
 	return len(p), nil
 }
@@ -1577,6 +1571,7 @@ func (m *machine) Read(p []byte) (n int, err error) {
 type Rand interface {
 	Int() int
 	Uint64() uint64
+	Uint32() uint32
 	Float64() float64
 	Read([]byte) (n int, err error)
 }
@@ -1587,12 +1582,36 @@ func (m *machine) Now() time.Time {
 		m.ts++
 	}
 	return time.Unix(0, ts).UTC()
+
 }
+
+// #region mulberry32
+
+// This is a weirdly good prng. I'm using this so that I can support interop
+// apps on older archs and limited languages, like 32-bit OSs and Javascript.
+// https://gist.github.com/tommyettinger/46a874533244883189143505d203312c
+
+// rgen generates a random uint32. This is basically a port of the next() C
+// function, except that the seed increment is ripped out. For Uhaha it's
+// intended for the seeding to occur prior to this call.
+func rgen(seed uint32) uint32 {
+	z := seed
+	z = (z ^ (z >> 15)) * (z | 1)
+	z ^= z + (z^(z>>7))*(z|61)
+	return z ^ (z >> 14)
+}
+
+// rincr increments the seed prior to using in rgen32
+func rincr(seed uint32) uint32 {
+	return seed + 0x6D2B79F5
+}
+
+// #endregion mulberry32
 
 // RawMachineInfo represents the raw components of the machine
 type RawMachineInfo struct {
 	TS   int64
-	Seed int64
+	Seed uint32
 }
 
 // ReadRawMachineInfo reads the raw machine components.
@@ -1628,14 +1647,14 @@ func cmdTICK(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
 	if ts < 0 || ts <= m.ts {
 		return nil, errors.New("timestamp is not monotonic")
 	}
-	seed, err := strconv.ParseInt(args[2], 10, 64)
+	seed, err := strconv.ParseUint(args[2], 10, 32)
 	if err != nil {
 		return nil, err
 	}
-	if seed == m.seed {
+	if seed == uint64(m.seed) {
 		return nil, errors.New("random number has not changed")
 	}
-	m.seed = seed
+	m.seed = uint32(seed)
 	m.ts = ts
 	if m.start == 0 {
 		m.start = m.ts
