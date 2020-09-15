@@ -452,7 +452,7 @@ func stateChangeFilter(line string, log *redlog.Logger) string {
 type restoreData struct {
 	data  interface{}
 	ts    int64
-	seed  uint32
+	seed  int64
 	start int64
 }
 
@@ -984,13 +984,13 @@ func runTicker(conf Config, rt *remoteTime, m *machine, ra *raft.Raft,
 			}
 			rnb = rbuf[:]
 		}
-		seed := binary.LittleEndian.Uint32(rnb)
-		rnb = rnb[4:]
+		seed := int64(binary.LittleEndian.Uint64(rnb))
+		rnb = rnb[8:]
 		req := new(writeRequestFuture)
 		req.args = []string{
 			"tick",
 			strconv.FormatInt(ts, 10),
-			strconv.FormatUint(uint64(seed), 10),
+			strconv.FormatInt(seed, 10),
 		}
 		req.wg.Add(1)
 		m.wrC <- req
@@ -1270,7 +1270,7 @@ func (m *machine) Snapshot() (raft.FSMSnapshot, error) {
 	return snap, nil
 }
 
-func readSnapHead(r io.Reader) (start, ts int64, seed uint32, err error) {
+func readSnapHead(r io.Reader) (start, ts, seed int64, err error) {
 	var head [32]byte
 	n, err := io.ReadFull(r, head[:])
 	if err != nil {
@@ -1284,7 +1284,7 @@ func readSnapHead(r io.Reader) (start, ts int64, seed uint32, err error) {
 	}
 	start = int64(binary.LittleEndian.Uint64(head[8:]))
 	ts = int64(binary.LittleEndian.Uint64(head[16:]))
-	seed = uint32(binary.LittleEndian.Uint64(head[24:]))
+	seed = int64(binary.LittleEndian.Uint64(head[24:]))
 	return start, ts, seed, nil
 }
 
@@ -1325,7 +1325,7 @@ type fsmSnap struct {
 	dir   string
 	snap  Snapshot
 	ts    int64
-	seed  uint32
+	seed  int64
 	start int64
 }
 
@@ -1436,7 +1436,7 @@ type machine struct {
 	snap         bool         // snapshot in progress
 	start        int64        // !! PERSISTED !! first non-zero timestamp
 	ts           int64        // !! PERSISTED !! current timestamp
-	seed         uint32       // !! PERSISTED !! current seed
+	seed         int64        // !! PERSISTED !! current seed
 	data         interface{}  // !! PERSISTED !! user data
 
 	wrC chan *writeRequestFuture
@@ -1525,7 +1525,7 @@ func (m *machine) Rand() Rand {
 }
 
 func (m *machine) Uint32() uint32 {
-	seed := rincr(m.seed)
+	seed := rincr(rincr(m.seed)) // twice called intentionally
 	x := rgen(seed)
 	if atomic.LoadInt32(&m.readers) == 0 {
 		m.seed = seed
@@ -1546,7 +1546,7 @@ func (m *machine) Float64() float64 {
 }
 
 func (m *machine) Read(p []byte) (n int, err error) {
-	seed := m.seed
+	seed := rincr(m.seed)
 	for len(p) >= 4 {
 		seed = rincr(seed)
 		binary.LittleEndian.PutUint32(p, rgen(seed))
@@ -1575,6 +1575,21 @@ type Rand interface {
 	Read([]byte) (n int, err error)
 }
 
+// #region -- pcg-family random number generator
+
+func rincr(seed int64) int64 {
+	return int64(uint64(seed)*6364136223846793005 + 1)
+}
+
+func rgen(seed int64) uint32 {
+	state := uint64(seed)
+	xorshifted := uint32(((state >> 18) ^ state) >> 27)
+	rot := uint32(state >> 59)
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
+}
+
+// #endregion -- pcg-family random number generator
+
 func (m *machine) Now() time.Time {
 	ts := m.ts
 	if atomic.LoadInt32(&m.readers) == 0 {
@@ -1583,34 +1598,10 @@ func (m *machine) Now() time.Time {
 	return time.Unix(0, ts).UTC()
 }
 
-// #region mulberry32
-
-// This is a weirdly good prng. I'm using this so that I can support interop
-// apps on smaller archs and limited languages, like 32-bit OSs and Javascript.
-// The original C code is from:
-// https://gist.github.com/tommyettinger/46a874533244883189143505d203312c
-
-// rgen generates a random uint32. This is basically a port of the next() C
-// function, except that the seed increment is ripped out. For Uhaha it's
-// intended for the seeding to occur prior to this call.
-func rgen(seed uint32) uint32 {
-	z := seed
-	z = (z ^ (z >> 15)) * (z | 1)
-	z ^= z + (z^(z>>7))*(z|61)
-	return z ^ (z >> 14)
-}
-
-// rincr increments the seed prior to using in rgen
-func rincr(seed uint32) uint32 {
-	return seed + 0x6D2B79F5
-}
-
-// #endregion mulberry32
-
 // RawMachineInfo represents the raw components of the machine
 type RawMachineInfo struct {
 	TS   int64
-	Seed uint32
+	Seed int64
 }
 
 // ReadRawMachineInfo reads the raw machine components.
@@ -1646,14 +1637,14 @@ func cmdTICK(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
 	if ts < 0 || ts <= m.ts {
 		return nil, errors.New("timestamp is not monotonic")
 	}
-	seed, err := strconv.ParseUint(args[2], 10, 32)
+	seed, err := strconv.ParseInt(args[2], 10, 64)
 	if err != nil {
 		return nil, err
 	}
-	if seed == uint64(m.seed) {
+	if seed == m.seed {
 		return nil, errors.New("random number has not changed")
 	}
-	m.seed = uint32(seed)
+	m.seed = seed
 	m.ts = ts
 	if m.start == 0 {
 		m.start = m.ts
