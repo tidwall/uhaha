@@ -2290,11 +2290,24 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	case 's': // system
 		s.waitWrite(opts.From)
 		start := time.Now()
-		resp, err := cmd.fn(s.m, s.ra, args)
+		resp, err := s.execSystem(cmd, args, opts)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:
 		return Response(nil, 0, errors.New("invalid request"))
 	}
+}
+
+func (s *service) execSystem(cmd command, args []string, opts *SendOptions,
+) (interface{}, error) {
+	// System commands are performed regardless of the raft server state.
+	s.m.mu.RLock()
+	atomic.AddInt32(&s.m.readers, 1)
+	defer func() {
+		// Return the machine to write access mode
+		atomic.AddInt32(&s.m.readers, -1)
+		s.m.mu.RUnlock()
+	}()
+	return cmd.fn(s.m, s.ra, args)
 }
 
 func (s *service) execRead(cmd command, args []string, opts *SendOptions,
