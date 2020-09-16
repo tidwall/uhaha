@@ -1372,6 +1372,9 @@ func errUnknownRaftCommand(args []string) error {
 // ErrSyntax is returned where there was a syntax error
 var ErrSyntax = errors.New("syntax error")
 
+// ErrNotLeader is returned when the raft leader is unknown
+var ErrNotLeader = raft.ErrNotLeader
+
 type command struct {
 	kind byte // 's' system, 'r' read, 'w' write
 	fn   func(m *machine, ra *raft.Raft, args []string) (interface{}, error)
