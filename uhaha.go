@@ -1385,16 +1385,17 @@ type command struct {
 // commands.
 //
 // It's important to note that the Rand() and Now() functions can be used
-// safely in Write, Read, and Passive commands. But, that each call to Rand()
-// and Now() from inside of a Read/Passive command will always return back the
-// same last known value of it's respective type. While, from a Write command,
-// you'll get freshly generated values. This is to ensure that the every single
-// command ALWAYS generates the same series of data on every server.
+// safely for Write and Read commands, but not for Passive commands. Each call
+// to Rand() and Now() from inside of a Read command will always return back
+// the same last known value of it's respective type. While, from a Write
+// command, you'll get freshly generated values. This is to ensure that
+// the every single command ALWAYS generates the same series of data on every
+// server. Using Data(), Now(), and Rand() from Passive commands is bad news.
 type Machine interface {
 	// Data is the original user data interface that was assigned at startup.
 	// It's safe to alter the data in this interface while inside a Write
-	// command, but it's only safe to read from this interface for Read and
-	// Passive commands.
+	// command, but it's only safe to read from this interface for Read
+	// commands.
 	Data() interface{}
 	// Now generates a stable timestamp that is synced with internet time
 	// and for Write commands is always monotonical increasing. It's made to
@@ -2293,23 +2294,16 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	case 's': // system
 		s.waitWrite(opts.From)
 		start := time.Now()
-		resp, err := s.execSystem(cmd, args, opts)
+		resp, err := s.execPassive(cmd, args, opts)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:
 		return Response(nil, 0, errors.New("invalid request"))
 	}
 }
 
-func (s *service) execSystem(cmd command, args []string, opts *SendOptions,
+func (s *service) execPassive(cmd command, args []string, opts *SendOptions,
 ) (interface{}, error) {
 	// System commands are performed regardless of the raft server state.
-	s.m.mu.RLock()
-	atomic.AddInt32(&s.m.readers, 1)
-	defer func() {
-		// Return the machine to write access mode
-		atomic.AddInt32(&s.m.readers, -1)
-		s.m.mu.RUnlock()
-	}()
 	return cmd.fn(s.m, s.ra, args)
 }
 
