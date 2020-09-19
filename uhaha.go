@@ -163,6 +163,16 @@ type Config struct {
 	// path to the directory where all the logs and snapshots are stored.
 	DataDirReady func(dir string)
 
+	// ConnOpened is an optional callback function that fires when a new
+	// network connection was opened on this machine. You can accept or deny
+	// the connection, and optionally provide a client-specific context that
+	// stick around until the connection is closed with ConnClosed.
+	ConnOpened func(addr string) (context interface{}, accept bool)
+
+	// ConnClosed is an optional callback function that fires when a network
+	// connection has been closed on this machine.
+	ConnClosed func(context interface{}, addr string)
+
 	LocalTime     bool          // default false
 	TickDelay     time.Duration // default 200ms
 	BackupPath    string        // default ""
@@ -327,7 +337,7 @@ func (conf *Config) addCommand(kind byte, name string,
 	if conf.cmds == nil {
 		conf.cmds = make(map[string]command)
 	}
-	conf.cmds[name] = command{kind, func(m *machine, ra *raft.Raft,
+	conf.cmds[name] = command{kind, func(m Machine, ra *raft.Raft,
 		args []string) (interface{}, error) {
 		return fn(m, args)
 	}}
@@ -576,6 +586,8 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 		m.data = conf.InitialData
 	}
 	m.log = log
+	m.connClosed = conf.ConnClosed
+	m.connOpened = conf.ConnOpened
 	m.snapshot = conf.Snapshot
 	m.restore = conf.Restore
 	m.jsonSnaps = conf.jsonSnaps
@@ -1314,6 +1326,10 @@ func (m *machine) Restore(rc io.ReadCloser) error {
 	return err
 }
 
+func (m *machine) Context() interface{} {
+	return nil
+}
+
 // A Snapshot is an interface that allows for Raft snapshots to be taken.
 type Snapshot interface {
 	Persist(io.Writer) error
@@ -1377,30 +1393,34 @@ var ErrNotLeader = raft.ErrNotLeader
 
 type command struct {
 	kind byte // 's' system, 'r' read, 'w' write
-	fn   func(m *machine, ra *raft.Raft, args []string) (interface{}, error)
+	fn   func(m Machine, ra *raft.Raft, args []string) (interface{}, error)
 }
 
 // The Machine interface is passed to every command. It includes the user data
 // and various utilities that should be used from Write, Read, and Passive
 // commands.
 //
-// It's important to note that the Rand() and Now() functions can be used
-// safely for Write and Read commands, but not for Passive commands. Each call
-// to Rand() and Now() from inside of a Read command will always return back
-// the same last known value of it's respective type. While, from a Write
+// It's important to note that the Data(), Now(), and Rand() functions can be
+// used safely for Write and Read commands, but are not available for Passive
+// commands. The Context() is ONLY available for Passive commands.
+//
+// A call to Rand() and Now() from inside of a Read command will always return
+// back the same last known value of it's respective type. While, from a Write
 // command, you'll get freshly generated values. This is to ensure that
 // the every single command ALWAYS generates the same series of data on every
-// server. Using Data(), Now(), and Rand() from Passive commands is bad news.
+// server.
 type Machine interface {
 	// Data is the original user data interface that was assigned at startup.
 	// It's safe to alter the data in this interface while inside a Write
 	// command, but it's only safe to read from this interface for Read
 	// commands.
+	// Returns nil for Passive Commands.
 	Data() interface{}
 	// Now generates a stable timestamp that is synced with internet time
 	// and for Write commands is always monotonical increasing. It's made to
 	// be a trusted source of time for performing operations on the user data.
 	// Always use this function instead of the builtin time.Now().
+	// Returns nil for Passive Commands.
 	Now() time.Time
 	// Rand is a random number generator that must be used instead of the
 	// standard Go packages `crypto/rand` and `math/rand`. For Write commands
@@ -1408,24 +1428,31 @@ type Machine interface {
 	// to be reproduced in exact order when the server restarts, and identical
 	// across all machines in the cluster. The underlying implementation is
 	// PCG. Check out http://www.pcg-random.org/ for more information.
+	// Returns nil for Passive Commands.
 	Rand() Rand
 	// Utility logger for printing information to the local server log.
 	Log() Logger
+	// Context returns the connection context that was defined in from the
+	// Config.ConnOpened callback. Only available for Passive commands.
+	// Returns nil for Read and Write Commands.
+	Context() interface{}
 }
 
 type machine struct {
-	snapshot  func(data interface{}) (Snapshot, error)
-	restore   func(rd io.Reader) (data interface{}, err error)
-	jsonSnaps bool               //
-	jsonType  reflect.Type       //
-	snaps     raft.SnapshotStore //
-	dir       string             //
-	tick      func(m Machine)    //
-	created   int64              // machine instance created timestamp
-	commands  map[string]command // command table
-	log       Logger             // shared logger
-	openReads bool               // open reads on by default
-	tickDelay time.Duration      // ticker delay
+	snapshot   func(data interface{}) (Snapshot, error)
+	restore    func(rd io.Reader) (data interface{}, err error)
+	connOpened func(addr string) (context interface{}, accept bool)
+	connClosed func(context interface{}, addr string)
+	jsonSnaps  bool               //
+	jsonType   reflect.Type       //
+	snaps      raft.SnapshotStore //
+	dir        string             //
+	tick       func(m Machine)    //
+	created    int64              // machine instance created timestamp
+	commands   map[string]command // command table
+	log        Logger             // shared logger
+	openReads  bool               // open reads on by default
+	tickDelay  time.Duration      // ticker delay
 
 	mu           sync.RWMutex // protect all things in group
 	firstIndex   uint64       // first applied index
@@ -1445,6 +1472,8 @@ type machine struct {
 
 	wrC chan *writeRequestFuture
 }
+
+var _ Machine = &machine{}
 
 type applyResp struct {
 	resp interface{}
@@ -1602,6 +1631,31 @@ func (m *machine) Now() time.Time {
 	return time.Unix(0, ts).UTC()
 }
 
+// passiveMachine wraps the machine in a connection context
+type passiveMachine struct {
+	context interface{}
+	m       *machine
+}
+
+var _ Machine = passiveMachine{}
+
+func (m passiveMachine) Now() time.Time       { return time.Time{} }
+func (m passiveMachine) Context() interface{} { return m.context }
+func (m passiveMachine) Log() Logger          { return m.m.log }
+func (m passiveMachine) Rand() Rand           { return nil }
+func (m passiveMachine) Data() interface{}    { return nil }
+
+func getBaseMachine(m Machine) *machine {
+	switch m := m.(type) {
+	case passiveMachine:
+		return m.m
+	case *machine:
+		return m
+	default:
+		return nil
+	}
+}
+
 // RawMachineInfo represents the raw components of the machine
 type RawMachineInfo struct {
 	TS   int64
@@ -1611,7 +1665,7 @@ type RawMachineInfo struct {
 // ReadRawMachineInfo reads the raw machine components.
 func ReadRawMachineInfo(m Machine, info *RawMachineInfo) {
 	*info = RawMachineInfo{}
-	if m, ok := m.(*machine); ok {
+	if m := getBaseMachine(m); m != nil {
 		info.TS = m.ts
 		info.Seed = m.seed
 	}
@@ -1620,7 +1674,7 @@ func ReadRawMachineInfo(m Machine, info *RawMachineInfo) {
 // WriteRawMachineInfo writes raw components to the machine. Use with care as
 // this operation may destroy the consistency of your cluster.
 func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
-	if m, ok := m.(*machine); ok {
+	if m := getBaseMachine(m); m != nil {
 		m.ts = info.TS
 		m.seed = info.Seed
 	}
@@ -1630,7 +1684,11 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 // help: updates the machine timestamp and random seed. It's not possible to
 //       directly call this from a client service. It can only be called by
 //       its own internal server instance.
-func cmdTICK(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdTICK(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	if len(args) != 3 {
 		return nil, ErrWrongNumArgs
 	}
@@ -1664,7 +1722,11 @@ func cmdTICK(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
 
 // RAFT subcommand args...
 // help: calls a system-level raft operation.
-func cmdRAFT(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdRAFT(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	if len(args) < 2 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -1678,7 +1740,7 @@ func cmdRAFT(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
 
 // RAFT LEADER
 // help: returns the current leader; string
-func cmdRAFTLEADER(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTLEADER(um Machine, ra *raft.Raft, args []string,
 ) (interface{}, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
@@ -1687,8 +1749,12 @@ func cmdRAFTLEADER(m *machine, ra *raft.Raft, args []string,
 }
 
 // RAFT SERVER subcommand args...
-func cmdRAFTSERVER(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSERVER(um Machine, ra *raft.Raft, args []string,
 ) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	if len(args) < 3 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -1760,8 +1826,12 @@ func cmdRAFTSERVERADD(m *machine, ra *raft.Raft, args []string,
 
 // RAFT INFO [pattern]
 // help: returns various raft related info; map[string]string
-func cmdRAFTINFO(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTINFO(um Machine, ra *raft.Raft, args []string,
 ) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	pattern := "*"
 	switch len(args) {
 	case 2:
@@ -1787,8 +1857,12 @@ func cmdRAFTINFO(m *machine, ra *raft.Raft, args []string,
 }
 
 // RAFT SNAPSHOT subcommand args...
-func cmdRAFTSNAPSHOT(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOT(um Machine, ra *raft.Raft, args []string,
 ) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	if len(args) < 3 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -1989,7 +2063,7 @@ var raftCommands = map[string]command{
 
 // RAFT HELP
 // help: returns the valid RAFT related commands; []string
-func cmdRAFTHELP(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTHELP(um Machine, ra *raft.Raft, args []string,
 ) (interface{}, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
@@ -2011,7 +2085,11 @@ func cmdRAFTHELP(m *machine, ra *raft.Raft, args []string,
 }
 
 // MACHINE [HUMAN]
-func cmdMACHINE(m *machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdMACHINE(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
 	var human bool
 	switch len(args) {
 	case 1:
@@ -2092,6 +2170,7 @@ type Receiver interface {
 
 // SendOptions ...
 type SendOptions struct {
+	Context        interface{}
 	From           interface{}
 	AllowOpenReads bool
 	DenyOpenReads  bool
@@ -2199,6 +2278,10 @@ type Service interface {
 	Log() Logger
 	// Monitor returns a service monitor for observing client commands.
 	Monitor() Monitor
+	// Opened
+	Opened(addr string) (context interface{}, accept bool)
+	// Closed
+	Closed(context interface{}, addr string)
 }
 
 type serviceEntry struct {
@@ -2291,20 +2374,28 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 		start := time.Now()
 		resp, err := s.execRead(cmd, args, opts)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
-	case 's': // system
+	case 's': // passive/system
 		s.waitWrite(opts.From)
 		start := time.Now()
-		resp, err := s.execPassive(cmd, args, opts)
+		pm := passiveMachine{m: s.m, context: opts.Context}
+		resp, err := cmd.fn(pm, s.ra, args)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:
 		return Response(nil, 0, errors.New("invalid request"))
 	}
 }
 
-func (s *service) execPassive(cmd command, args []string, opts *SendOptions,
-) (interface{}, error) {
-	// System commands are performed regardless of the raft server state.
-	return cmd.fn(s.m, s.ra, args)
+func (s *service) Opened(addr string) (context interface{}, accept bool) {
+	if s.m.connOpened != nil {
+		return s.m.connOpened(addr)
+	}
+	return nil, true
+}
+
+func (s *service) Closed(context interface{}, addr string) {
+	if s.m.connClosed != nil {
+		s.m.connClosed(context, addr)
+	}
 }
 
 func (s *service) execRead(cmd command, args []string, opts *SendOptions,
@@ -2532,23 +2623,38 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 }
 
 func redisServiceHandler(s Service, ln net.Listener) {
+
 	s.Log().Fatal(redcon.Serve(ln,
+		// handle commands
 		func(conn redcon.Conn, cmd redcon.Command) {
-			var client *redisClient
-			if v := conn.Context(); v != nil {
-				client = v.(*redisClient)
-			} else {
-				client = new(redisClient)
-				client.opts.From = client
-				conn.SetContext(client)
-			}
+			client := conn.Context().(*redisClient)
 			var args [][]string
 			args = append(args, redisCommandToArgs(cmd))
 			for _, cmd := range conn.ReadPipeline() {
 				args = append(args, redisCommandToArgs(cmd))
 			}
 			redisServiceExecArgs(s, client, conn, args)
-		}, nil, nil),
+		},
+		// handle opened connection
+		func(conn redcon.Conn) bool {
+			context, accept := s.Opened(conn.RemoteAddr())
+			if !accept {
+				return false
+			}
+			client := new(redisClient)
+			client.opts.From = client
+			client.opts.Context = context
+			conn.SetContext(client)
+			return true
+		},
+		// handle closed connection
+		func(conn redcon.Conn, err error) {
+			if conn.Context() == nil {
+				return
+			}
+			client := conn.Context().(*redisClient)
+			s.Closed(client.opts.Context, conn.RemoteAddr())
+		}),
 	)
 }
 
