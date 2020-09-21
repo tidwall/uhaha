@@ -110,6 +110,7 @@ Advanced options:
 // This must be fill out prior and then passed to the uhaha.Main() function.
 type Config struct {
 	cmds      map[string]command // appended by AddCommand
+	catchall  command            // set by AddCatchallCommand
 	services  []serviceEntry     // appended by AddService
 	jsonType  reflect.Type       // used by UseJSONSnapshots
 	jsonSnaps bool               // used by UseJSONSnapshots
@@ -338,6 +339,18 @@ func (conf *Config) addCommand(kind byte, name string,
 		conf.cmds = make(map[string]command)
 	}
 	conf.cmds[name] = command{kind, func(m Machine, ra *raft.Raft,
+		args []string) (interface{}, error) {
+		return fn(m, args)
+	}}
+}
+
+// AddCatchallCommand adds a passive command that will execute for any input
+// that was not previously defined with AddPassiveCommand, AddWriteCommand, or
+// AddReadCommand.
+func (conf *Config) AddCatchallCommand(
+	fn func(m Machine, args []string) (interface{}, error),
+) {
+	conf.catchall = command{'s', func(m Machine, ra *raft.Raft,
 		args []string) (interface{}, error) {
 		return fn(m, args)
 	}}
@@ -603,6 +616,7 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 			m.commands[k] = v
 		}
 	}
+	m.catchall = conf.catchall
 	return m
 }
 
@@ -1450,6 +1464,7 @@ type machine struct {
 	tick       func(m Machine)    //
 	created    int64              // machine instance created timestamp
 	commands   map[string]command // command table
+	catchall   command            // catchall command
 	log        Logger             // shared logger
 	openReads  bool               // open reads on by default
 	tickDelay  time.Duration      // ticker delay
@@ -2349,7 +2364,10 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	cmdName := strings.ToLower(args[0])
 	cmd, ok := s.m.commands[cmdName]
 	if !ok {
-		return Response(nil, 0, ErrUnknownCommand)
+		if s.m.catchall.kind == 0 {
+			return Response(nil, 0, ErrUnknownCommand)
+		}
+		cmd = s.m.catchall
 	}
 	if cmdName == "tick" {
 		// The "tick" command is explicitly denied from being called by a
