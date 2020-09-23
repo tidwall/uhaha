@@ -69,7 +69,7 @@ func Main(conf Config) {
 	log.Fatal(svr.serve())
 }
 
-const usage = `{{NAME}} version: {{VERSION}}
+const usage = `{{NAME}} version: {{VERSION}} ({{GITSHA}})
 
 Usage: {{NAME}} [-n id] [-a addr] [options]
 
@@ -120,6 +120,9 @@ type Config struct {
 
 	// Version of the application. Default "0.0.0"
 	Version string
+
+	// GitSHA of the application.
+	GitSHA string
 
 	// Flag is used to manage the application startup flags.
 	Flag struct {
@@ -252,6 +255,12 @@ func confInit(conf *Config) {
 		}
 		s := usage
 		s = strings.Replace(s, "{{VERSION}}", conf.Version, -1)
+		if conf.GitSHA == "" {
+			s = strings.Replace(s, " ({{GITSHA}})", "", -1)
+			s = strings.Replace(s, "{{GITSHA}}", "", -1)
+		} else {
+			s = strings.Replace(s, "{{GITSHA}}", conf.GitSHA, -1)
+		}
 		s = strings.Replace(s, "{{NAME}}", conf.Name, -1)
 		if conf.Flag.Usage != nil {
 			s = conf.Flag.Usage(s)
@@ -285,6 +294,10 @@ func confInit(conf *Config) {
 		conf.Flag.PreParse()
 	}
 	flag.Parse()
+	if vers {
+		fmt.Printf("%s\n", versline(*conf))
+		os.Exit(0)
+	}
 	switch backend {
 	case "leveldb":
 		conf.Backend = LevelDB
@@ -420,6 +433,14 @@ func jsonRestore(rd io.Reader, typ reflect.Type) (interface{}, error) {
 	return data, err
 }
 
+func versline(conf Config) string {
+	sha := ""
+	if conf.GitSHA != "" {
+		sha = " (" + conf.GitSHA + ")"
+	}
+	return fmt.Sprintf("%s version %s%s", conf.Name, conf.Version, sha)
+}
+
 func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 	var log *redlog.Logger
 	logLevel := conf.LogLevel
@@ -451,7 +472,7 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 	hclopts := *hclog.DefaultOptions
 	hclopts.Color = hclog.ColorOff
 	hclopts.Output = log
-	log.Warningf("starting %s version %s", conf.Name, conf.Version)
+	log.Warningf("starting %s", versline(conf))
 	return hclog.New(&hclopts), log
 }
 
