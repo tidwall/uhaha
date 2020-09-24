@@ -167,6 +167,10 @@ type Config struct {
 	// path to the directory where all the logs and snapshots are stored.
 	DataDirReady func(dir string)
 
+	// LogReady is an optional callback function that fires when the logger has
+	// been initialized. The logger is can be safely used concurrently.
+	LogReady func(log Logger)
+
 	// ConnOpened is an optional callback function that fires when a new
 	// network connection was opened on this machine. You can accept or deny
 	// the connection, and optionally provide a client-specific context that
@@ -472,6 +476,9 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 	hclopts := *hclog.DefaultOptions
 	hclopts.Color = hclog.ColorOff
 	hclopts.Output = log
+	if conf.LogReady != nil {
+		conf.LogReady(log)
+	}
 	log.Warningf("starting %s", versline(conf))
 	return hclog.New(&hclopts), log
 }
