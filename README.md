@@ -17,7 +17,7 @@ and other stuff too.
 
 ## Features
 
-- Simple API for quickly creating a fault-tolerant cluster.
+- Simple API for quickly creating a high available fault-tolerant cluster.
 - Deterministic monotonic time that does not drift and stays in sync with the internet.
 - APIs for building custom services such as HTTP and gRPC. 
   Supports the Redis protocol by default, so any Redis-compatible client
