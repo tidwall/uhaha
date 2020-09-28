@@ -885,8 +885,9 @@ type raftWrap struct {
 func (ra *raftWrap) getExtraForAddr(addr string) (serverExtra, bool) {
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
-	for addr, extra := range ra.extra {
-		if addr == addr || extra.broadcast == addr || extra.remoteAddr == addr {
+	for eaddr, extra := range ra.extra {
+		if eaddr == addr || extra.broadcast == addr ||
+			extra.remoteAddr == addr {
 			return extra, true
 		}
 	}
