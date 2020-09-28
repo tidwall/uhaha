@@ -53,14 +53,14 @@ func Main(conf Config) {
 	dir, data := dataDirInit(conf, log)
 	m := machineInit(conf, dir, data, log)
 	tlscfg := tlsInit(conf, log)
-	svr, addr := serverInit(conf, tlscfg, log)
+	svr := serverInit(conf, tlscfg, log)
 	trans := transportInit(conf, tlscfg, svr, hclogger, log)
 	lstore, sstore := storeInit(conf, dir, log)
 	snaps := snapshotInit(conf, dir, m, hclogger, log)
 	ra := raftInit(conf, hclogger, m, lstore, sstore, snaps, trans, log)
 
-	joinClusterIfNeeded(conf, ra, tlscfg, addr, log)
-	startUserServices(conf, svr, m, ra, addr, log)
+	joinClusterIfNeeded(conf, ra, tlscfg, log)
+	startUserServices(conf, svr, m, ra, log)
 
 	go runWriteApplier(conf, m, ra)
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
@@ -76,7 +76,7 @@ Usage: {{NAME}} [-n id] [-a addr] [options]
 Basic options:
   -v              : display version
   -h              : display help, this screen
-  -a addr         : bind to address  (default: 127.0.0.1:11001)
+  -a addr         : bind and broadcast address  (default: 127.0.0.1:11001)
   -n id           : node ID  (default: 1)
   -d dir          : data directory  (default: data)
   -j addr         : leader address of a cluster to join
@@ -739,7 +739,7 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 // the server already belongs to a cluster or if the server is bootstrapping
 // then this operation is ignored.
 func joinClusterIfNeeded(conf Config, ra *raft.Raft, tlscfg *tlsConfig,
-	addr net.Addr, log *redlog.Logger,
+	log *redlog.Logger,
 ) {
 	// Get the current Raft cluster configuration for determining whether this
 	// server needs to bootstrap a new cluster, or join/re-join an existing
@@ -759,7 +759,7 @@ func joinClusterIfNeeded(conf Config, ra *raft.Raft, tlscfg *tlsConfig,
 			configuration.Servers = []raft.Server{
 				raft.Server{
 					ID:      raft.ServerID(conf.NodeID),
-					Address: raft.ServerAddress(addr.String()),
+					Address: raft.ServerAddress(conf.Addr),
 				},
 			}
 			err := ra.BootstrapCluster(configuration).Error()
@@ -776,7 +776,7 @@ func joinClusterIfNeeded(conf Config, ra *raft.Raft, tlscfg *tlsConfig,
 				}
 				defer conn.Close()
 				res, err := redis.String(conn.Do("raft", "server", "add",
-					conf.NodeID, addr))
+					conf.NodeID, conf.Addr))
 				if err != nil {
 					return err
 				}
@@ -824,7 +824,7 @@ func redisDial(addr, auth string, tlscfg *tlsConfig) (redis.Conn, error) {
 }
 
 func startUserServices(conf Config, svr *splitServer, m *machine, ra *raft.Raft,
-	addr net.Addr, log *redlog.Logger,
+	log *redlog.Logger,
 ) {
 	// rearrange so that services with nil sniffers are last
 	var nilServices []serviceEntry
@@ -1134,7 +1134,7 @@ func transportInit(conf Config, tlscfg *tlsConfig, svr *splitServer,
 }
 
 func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
-) (*splitServer, net.Addr) {
+) *splitServer {
 	var ln net.Listener
 	var err error
 	if tlscfg.server != nil {
@@ -1146,8 +1146,8 @@ func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
 		log.Fatal(err)
 	}
 	log.Printf("server listening at %s", ln.Addr())
-	svr := newSplitServer(ln, log)
-	return svr, ln.Addr()
+	log.Printf("server broadcasting at %s", conf.Addr)
+	return newSplitServer(ln, log)
 }
 
 type tlsConfig struct {
