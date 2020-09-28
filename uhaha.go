@@ -62,6 +62,7 @@ func Main(conf Config) {
 	joinClusterIfNeeded(conf, ra, tlscfg, log)
 	startUserServices(conf, svr, m, ra, log)
 
+	go runMaintainServers(ra)
 	go runWriteApplier(conf, m, ra)
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
 	go runTicker(conf, tm, m, ra, log)
@@ -355,7 +356,7 @@ func (conf *Config) addCommand(kind byte, name string,
 	if conf.cmds == nil {
 		conf.cmds = make(map[string]command)
 	}
-	conf.cmds[name] = command{kind, func(m Machine, ra *raft.Raft,
+	conf.cmds[name] = command{kind, func(m Machine, ra *raftWrap,
 		args []string) (interface{}, error) {
 		return fn(m, args)
 	}}
@@ -367,7 +368,7 @@ func (conf *Config) addCommand(kind byte, name string,
 func (conf *Config) AddCatchallCommand(
 	fn func(m Machine, args []string) (interface{}, error),
 ) {
-	conf.catchall = command{'s', func(m Machine, ra *raft.Raft,
+	conf.catchall = command{'s', func(m Machine, ra *raftWrap,
 		args []string) (interface{}, error) {
 		return fn(m, args)
 	}}
@@ -724,7 +725,7 @@ func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
 func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	logStore raft.LogStore, stableStore raft.StableStore,
 	snaps raft.SnapshotStore, trans raft.Transport, log *redlog.Logger,
-) *raft.Raft {
+) *raftWrap {
 	rconf := raft.DefaultConfig()
 	rconf.Logger = hclogger
 	rconf.LocalID = raft.ServerID(conf.NodeID)
@@ -732,23 +733,24 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	if err != nil {
 		log.Fatal(err)
 	}
-	return ra
+	return &raftWrap{Raft: ra}
 }
 
 // joinClusterIfNeeded attempts to make this server join a Raft cluster. If
 // the server already belongs to a cluster or if the server is bootstrapping
 // then this operation is ignored.
-func joinClusterIfNeeded(conf Config, ra *raft.Raft, tlscfg *tlsConfig,
+func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
 	log *redlog.Logger,
 ) {
 	// Get the current Raft cluster configuration for determining whether this
 	// server needs to bootstrap a new cluster, or join/re-join an existing
 	// cluster.
-	cfg := ra.GetConfiguration()
-	if err := cfg.Error(); err != nil {
+	f := ra.GetConfiguration()
+	if err := f.Error(); err != nil {
 		log.Fatalf("could not get Raft configuration: %v", err)
 	}
-	servers := cfg.Configuration().Servers
+	cfg := f.Configuration()
+	servers := cfg.Servers
 	if len(servers) == 0 {
 		// Empty configuration. Either bootstrap or join an existing cluster.
 		if conf.JoinAddr == "" {
@@ -789,9 +791,28 @@ func joinClusterIfNeeded(conf Config, ra *raft.Raft, tlscfg *tlsConfig,
 				log.Fatalf("raft server add: %v", err)
 			}
 		}
-	} else if conf.JoinAddr != "" {
-		log.Warningf(
-			"ignoring join request because server already belongs to a cluster")
+	} else {
+		if conf.JoinAddr != "" {
+			log.Warningf("ignoring join request because server already " +
+				"belongs to a cluster")
+		}
+		// Check that the address is the same as before
+		same := true
+		before := conf.Addr
+		for _, s := range servers {
+			if string(s.ID) == conf.NodeID {
+				if string(s.Address) != conf.Addr {
+					same = false
+					before = string(s.Address)
+					break
+				}
+			}
+		}
+		if !same {
+			log.Warningf("broadcast address change from \"%s\" to \"%s\" "+
+				"is ignored",
+				before, conf.Addr)
+		}
 	}
 }
 
@@ -823,7 +844,7 @@ func redisDial(addr, auth string, tlscfg *tlsConfig) (redis.Conn, error) {
 	return conn, nil
 }
 
-func startUserServices(conf Config, svr *splitServer, m *machine, ra *raft.Raft,
+func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 	log *redlog.Logger,
 ) {
 	// rearrange so that services with nil sniffers are last
@@ -848,9 +869,86 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raft.Raft,
 	}
 }
 
-func errRaftConvert(ra *raft.Raft, err error) error {
+type serverExtra struct {
+	reachable  bool   // server is reachable
+	remoteAddr string // remote tcp address
+	broadcast  string // broadcast address
+	lastError  error  // last error, if any
+}
+
+type raftWrap struct {
+	*raft.Raft
+	mu    sync.RWMutex
+	extra map[string]serverExtra
+}
+
+func (ra *raftWrap) getExtraForAddr(addr string) (serverExtra, bool) {
+	ra.mu.RLock()
+	defer ra.mu.RUnlock()
+	for addr, extra := range ra.extra {
+		if addr == addr || extra.broadcast == addr || extra.remoteAddr == addr {
+			return extra, true
+		}
+	}
+	return serverExtra{}, false
+}
+
+func runMaintainServers(ra *raftWrap) {
+	for {
+		f := ra.GetConfiguration()
+		if err := f.Error(); err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		cfg := f.Configuration()
+		var wg sync.WaitGroup
+		wg.Add(len(cfg.Servers))
+		for _, svr := range cfg.Servers {
+			go func(addr string) {
+				defer wg.Done()
+				c, err := net.DialTimeout("tcp", addr, time.Second*5)
+				if err == nil {
+					defer c.Close()
+				}
+				ra.mu.Lock()
+				defer ra.mu.Unlock()
+				if ra.extra == nil {
+					ra.extra = make(map[string]serverExtra)
+				}
+				extra := ra.extra[addr]
+				if err != nil {
+					extra.reachable = false
+					extra.lastError = err
+				} else {
+					extra.reachable = true
+					extra.lastError = nil
+					extra.remoteAddr = c.RemoteAddr().String()
+					extra.broadcast = addr
+				}
+				ra.extra[addr] = extra
+
+			}(string(svr.Address))
+		}
+		wg.Wait()
+		time.Sleep(time.Second)
+	}
+}
+
+func getLeaderBroadcastAddr(ra *raftWrap) string {
+	leader := string(ra.Leader())
+	if leader == "" {
+		return ""
+	}
+	extra, ok := ra.getExtraForAddr(leader)
+	if !ok {
+		return ""
+	}
+	return extra.broadcast
+}
+
+func errRaftConvert(ra *raftWrap, err error) error {
 	if err == raft.ErrNotLeader {
-		leader := string(ra.Leader())
+		leader := getLeaderBroadcastAddr(ra)
 		if leader != "" {
 			return fmt.Errorf("TRY %s", leader)
 		}
@@ -867,7 +965,7 @@ func appendUvarint(dst []byte, x uint64) []byte {
 // runWriteApplier is a background routine that handles all write requests.
 // It's job is to apply the request to the Raft log and returns the result to
 // writeRequest.
-func runWriteApplier(conf Config, m *machine, ra *raft.Raft) {
+func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
 	var maxReqs = 256 // TODO: make configurable
 	for {
 		// Gather up as many requests (up to 256) into a single list.
@@ -931,12 +1029,12 @@ func runWriteApplier(conf Config, m *machine, ra *raft.Raft) {
 
 var errLeaderUnknown = errors.New("leader unknown")
 
-func getClusterLastIndex(ra *raft.Raft, tlscfg *tlsConfig, auth string,
+func getClusterLastIndex(ra *raftWrap, tlscfg *tlsConfig, auth string,
 ) (uint64, error) {
 	if ra.State() == raft.Leader {
 		return ra.LastIndex(), nil
 	}
-	addr := string(ra.Leader())
+	addr := getLeaderBroadcastAddr(ra)
 	if addr == "" {
 		return 0, errLeaderUnknown
 	}
@@ -961,7 +1059,7 @@ func getClusterLastIndex(ra *raft.Raft, tlscfg *tlsConfig, auth string,
 
 // runLogLoadedPoller is a background routine that reports on raft log progress
 // and also maintains the m.logLoaded atomic boolean for open read systems.
-func runLogLoadedPoller(conf Config, m *machine, ra *raft.Raft,
+func runLogLoadedPoller(conf Config, m *machine, ra *raftWrap,
 	tlscfg *tlsConfig, log *redlog.Logger,
 ) {
 	var loaded bool
@@ -1023,7 +1121,7 @@ func runLogLoadedPoller(conf Config, m *machine, ra *raft.Raft,
 
 // runTicker is a background routine that keeps the raft machine time and
 // random seed updated.
-func runTicker(conf Config, rt *remoteTime, m *machine, ra *raft.Raft,
+func runTicker(conf Config, rt *remoteTime, m *machine, ra *raftWrap,
 	log *redlog.Logger,
 ) {
 	rbuf := make([]byte, 4096)
@@ -1435,7 +1533,7 @@ var ErrNotLeader = raft.ErrNotLeader
 
 type command struct {
 	kind byte // 's' system, 'r' read, 'w' write
-	fn   func(m Machine, ra *raft.Raft, args []string) (interface{}, error)
+	fn   func(m Machine, ra *raftWrap, args []string) (interface{}, error)
 }
 
 // The Machine interface is passed to every command. It includes the user data
@@ -1727,7 +1825,7 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 // help: updates the machine timestamp and random seed. It's not possible to
 //       directly call this from a client service. It can only be called by
 //       its own internal server instance.
-func cmdTICK(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -1765,7 +1863,7 @@ func cmdTICK(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
 
 // RAFT subcommand args...
 // help: calls a system-level raft operation.
-func cmdRAFT(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdRAFT(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -1783,16 +1881,16 @@ func cmdRAFT(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
 
 // RAFT LEADER
 // help: returns the current leader; string
-func cmdRAFTLEADER(um Machine, ra *raft.Raft, args []string,
+func cmdRAFTLEADER(um Machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
-	return string(ra.Leader()), nil
+	return getLeaderBroadcastAddr(ra), nil
 }
 
 // RAFT SERVER subcommand args...
-func cmdRAFTSERVER(um Machine, ra *raft.Raft, args []string,
+func cmdRAFTSERVER(um Machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
@@ -1816,7 +1914,7 @@ func cmdRAFTSERVER(um Machine, ra *raft.Raft, args []string,
 
 // RAFT SERVER LIST
 // help: returns a list of the servers in the cluster
-func cmdRAFTSERVERLIST(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
@@ -1829,17 +1927,29 @@ func cmdRAFTSERVERLIST(m *machine, ra *raft.Raft, args []string,
 	cfg := f.Configuration()
 	var servers [][]string
 	for i := 0; i < len(cfg.Servers); i++ {
-		servers = append(servers, []string{
+		data := []string{
 			"id", string(cfg.Servers[i].ID),
 			"address", string(cfg.Servers[i].Address),
-		})
+		}
+		extra, ok := ra.getExtraForAddr(string(cfg.Servers[i].Address))
+		if ok {
+			data = append(data, "resolved", extra.remoteAddr)
+			if extra.reachable {
+				data = append(data, "reachable", "yes")
+			} else {
+				data = append(data, "reachable", "no")
+			}
+		} else {
+			data = append(data, "reachable", "unknown")
+		}
+		servers = append(servers, data)
 	}
 	return servers, nil
 }
 
 // RAFT SERVER REMOVE id
 // help: removes a server from the cluster; bool
-func cmdRAFTSERVERREMOVE(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 4 {
 		return nil, errWrongNumArgsRaft
@@ -1854,7 +1964,7 @@ func cmdRAFTSERVERREMOVE(m *machine, ra *raft.Raft, args []string,
 
 // RAFT SERVER ADD id address
 // help: Returns true if server added, or error; bool
-func cmdRAFTSERVERADD(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 5 {
 		return nil, errWrongNumArgsRaft
@@ -1869,7 +1979,7 @@ func cmdRAFTSERVERADD(m *machine, ra *raft.Raft, args []string,
 
 // RAFT INFO [pattern]
 // help: returns various raft related info; map[string]string
-func cmdRAFTINFO(um Machine, ra *raft.Raft, args []string,
+func cmdRAFTINFO(um Machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
@@ -1900,7 +2010,7 @@ func cmdRAFTINFO(um Machine, ra *raft.Raft, args []string,
 }
 
 // RAFT SNAPSHOT subcommand args...
-func cmdRAFTSNAPSHOT(um Machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
@@ -1927,7 +2037,7 @@ func cmdRAFTSNAPSHOT(um Machine, ra *raft.Raft, args []string,
 // RAFT SNAPSHOT NOW
 // help: takes a snapshot of the data and returns information relating to the
 //       resulting snapshot; map[string]string
-func cmdRAFTSNAPSHOTNOW(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
@@ -1966,7 +2076,7 @@ func cmdRAFTSNAPSHOTNOW(m *machine, ra *raft.Raft, args []string,
 
 // RAFT SNAPSHOT LIST
 // help: returns a list of the current snapshots on disk. []map[string]string
-func cmdRAFTSNAPSHOTLIST(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOTLIST(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
@@ -1989,7 +2099,7 @@ func cmdRAFTSNAPSHOTLIST(m *machine, ra *raft.Raft, args []string,
 
 // RAFT SNAPSHOT FILE id
 // help: returns the path to the snapshot file; string
-func cmdRAFTSNAPSHOTFILE(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOTFILE(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 4 {
 		return nil, errWrongNumArgsRaft
@@ -2004,7 +2114,7 @@ func cmdRAFTSNAPSHOTFILE(m *machine, ra *raft.Raft, args []string,
 
 // RAFT SNAPSHOT READ id [RANGE offset limit]
 // help: reads the contents of a snapshot file; []byte
-func cmdRAFTSNAPSHOTREAD(m *machine, ra *raft.Raft, args []string,
+func cmdRAFTSNAPSHOTREAD(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	var id string
 	var offset, limit int64
@@ -2106,7 +2216,7 @@ var raftCommands = map[string]command{
 
 // RAFT HELP
 // help: returns the valid RAFT related commands; []string
-func cmdRAFTHELP(um Machine, ra *raft.Raft, args []string,
+func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
@@ -2128,7 +2238,7 @@ func cmdRAFTHELP(um Machine, ra *raft.Raft, args []string,
 }
 
 // MACHINE [HUMAN]
-func cmdMACHINE(um Machine, ra *raft.Raft, args []string) (interface{}, error) {
+func cmdMACHINE(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2334,7 +2444,7 @@ type serviceEntry struct {
 
 type service struct {
 	m    *machine
-	ra   *raft.Raft
+	ra   *raftWrap
 	auth string
 	mon  *monitor
 
@@ -2342,7 +2452,7 @@ type service struct {
 	write   map[interface{}]*writeRequestFuture
 }
 
-func newService(m *machine, ra *raft.Raft, auth string) *service {
+func newService(m *machine, ra *raftWrap, auth string) *service {
 	s := &service{m: m, ra: ra, auth: auth}
 	s.write = make(map[interface{}]*writeRequestFuture)
 	s.mon = newMonitor(s)
