@@ -53,13 +53,13 @@ func Main(conf Config) {
 	dir, data := dataDirInit(conf, log)
 	m := machineInit(conf, dir, data, log)
 	tlscfg := tlsInit(conf, log)
-	svr := serverInit(conf, tlscfg, log)
+	svr, addr := serverInit(conf, tlscfg, log)
 	trans := transportInit(conf, tlscfg, svr, hclogger, log)
 	lstore, sstore := storeInit(conf, dir, log)
 	snaps := snapshotInit(conf, dir, m, hclogger, log)
 	ra := raftInit(conf, hclogger, m, lstore, sstore, snaps, trans, log)
 
-	joinClusterIfNeeded(conf, ra, tlscfg, log)
+	joinClusterIfNeeded(conf, ra, addr, tlscfg, log)
 	startUserServices(conf, svr, m, ra, log)
 
 	go runMaintainServers(ra)
@@ -77,7 +77,7 @@ Usage: {{NAME}} [-n id] [-a addr] [options]
 Basic options:
   -v              : display version
   -h              : display help, this screen
-  -a addr         : bind and broadcast address  (default: 127.0.0.1:11001)
+  -a addr         : bind to address  (default: 127.0.0.1:11001)
   -n id           : node ID  (default: 1)
   -d dir          : data directory  (default: data)
   -j addr         : leader address of a cluster to join
@@ -105,6 +105,10 @@ Advanced options:
                     initial data. The other nodes must be re-joined. This
                     operation is ignored when a data directory already exists.
                     Cannot be used with -j flag.
+  --preserve-addr : preserve original address from -a flag for all raft and
+                    client broadcasting. This is useful if you rely on domain
+                    ip address resolution at runtime or have a complexly
+                    orchestrated network.
 `
 
 // Config is the configuration for managing the behavior of the application.
@@ -200,6 +204,7 @@ type Config struct {
 	TLSKeyPath    string        // default ""
 	TLSCACertPath string        // default ""
 	Auth          string        // default ""
+	PreseveAddr   bool          // default false
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -294,6 +299,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.BackupPath, "restore", conf.BackupPath, "")
 	flag.BoolVar(&conf.LocalTime, "localtime", conf.LocalTime, "")
 	flag.StringVar(&conf.Auth, "auth", conf.Auth, "")
+	flag.BoolVar(&conf.PreseveAddr, "preserve-addr", conf.PreseveAddr, "")
 	flag.StringVar(&testNode, "t", "", "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
@@ -733,14 +739,17 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	if err != nil {
 		log.Fatal(err)
 	}
-	return &raftWrap{Raft: ra}
+	return &raftWrap{
+		Raft:         ra,
+		preserveAddr: conf.PreseveAddr,
+	}
 }
 
 // joinClusterIfNeeded attempts to make this server join a Raft cluster. If
 // the server already belongs to a cluster or if the server is bootstrapping
 // then this operation is ignored.
-func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
-	log *redlog.Logger,
+func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
+	tlscfg *tlsConfig, log *redlog.Logger,
 ) {
 	// Get the current Raft cluster configuration for determining whether this
 	// server needs to bootstrap a new cluster, or join/re-join an existing
@@ -748,6 +757,12 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
 	f := ra.GetConfiguration()
 	if err := f.Error(); err != nil {
 		log.Fatalf("could not get Raft configuration: %v", err)
+	}
+	var addrStr string
+	if ra.preserveAddr {
+		addrStr = conf.Addr
+	} else {
+		addrStr = addr.String()
 	}
 	cfg := f.Configuration()
 	servers := cfg.Servers
@@ -757,11 +772,12 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
 			// No '-join' flag provided.
 			// Bootstrap new cluster.
 			log.Noticef("bootstrapping new cluster")
+
 			var configuration raft.Configuration
 			configuration.Servers = []raft.Server{
 				raft.Server{
 					ID:      raft.ServerID(conf.NodeID),
-					Address: raft.ServerAddress(conf.Addr),
+					Address: raft.ServerAddress(addrStr),
 				},
 			}
 			err := ra.BootstrapCluster(configuration).Error()
@@ -778,7 +794,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
 				}
 				defer conn.Close()
 				res, err := redis.String(conn.Do("raft", "server", "add",
-					conf.NodeID, conf.Addr))
+					conf.NodeID, addrStr))
 				if err != nil {
 					return err
 				}
@@ -796,22 +812,24 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, tlscfg *tlsConfig,
 			log.Warningf("ignoring join request because server already " +
 				"belongs to a cluster")
 		}
-		// Check that the address is the same as before
-		same := true
-		before := conf.Addr
-		for _, s := range servers {
-			if string(s.ID) == conf.NodeID {
-				if string(s.Address) != conf.Addr {
-					same = false
-					before = string(s.Address)
-					break
+		if ra.preserveAddr {
+			// Check that the address is the same as before
+			same := true
+			before := conf.Addr
+			for _, s := range servers {
+				if string(s.ID) == conf.NodeID {
+					if string(s.Address) != conf.Addr {
+						same = false
+						before = string(s.Address)
+						break
+					}
 				}
 			}
-		}
-		if !same {
-			log.Warningf("broadcast address change from \"%s\" to \"%s\" "+
-				"is ignored",
-				before, conf.Addr)
+			if !same {
+				log.Warningf("broadcast address change from \"%s\" to \"%s\" "+
+					"is ignored",
+					before, conf.Addr)
+			}
 		}
 	}
 }
@@ -878,11 +896,15 @@ type serverExtra struct {
 
 type raftWrap struct {
 	*raft.Raft
-	mu    sync.RWMutex
-	extra map[string]serverExtra
+	preserveAddr bool
+	mu           sync.RWMutex
+	extra        map[string]serverExtra
 }
 
-func (ra *raftWrap) getExtraForAddr(addr string) (serverExtra, bool) {
+func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
+	if !ra.preserveAddr {
+		return extra, false
+	}
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
 	for eaddr, extra := range ra.extra {
@@ -891,10 +913,13 @@ func (ra *raftWrap) getExtraForAddr(addr string) (serverExtra, bool) {
 			return extra, true
 		}
 	}
-	return serverExtra{}, false
+	return extra, false
 }
 
 func runMaintainServers(ra *raftWrap) {
+	if !ra.preserveAddr {
+		return
+	}
 	for {
 		f := ra.GetConfiguration()
 		if err := f.Error(); err != nil {
@@ -937,6 +962,9 @@ func runMaintainServers(ra *raftWrap) {
 
 func getLeaderBroadcastAddr(ra *raftWrap) string {
 	leader := string(ra.Leader())
+	if !ra.preserveAddr {
+		return leader
+	}
 	if leader == "" {
 		return ""
 	}
@@ -1233,7 +1261,7 @@ func transportInit(conf Config, tlscfg *tlsConfig, svr *splitServer,
 }
 
 func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
-) *splitServer {
+) (*splitServer, net.Addr) {
 	var ln net.Listener
 	var err error
 	if tlscfg.server != nil {
@@ -1245,8 +1273,10 @@ func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
 		log.Fatal(err)
 	}
 	log.Printf("server listening at %s", ln.Addr())
-	log.Printf("server broadcasting at %s", conf.Addr)
-	return newSplitServer(ln, log)
+	if conf.PreseveAddr {
+		log.Printf("server broadcasting at %s", conf.Addr)
+	}
+	return newSplitServer(ln, log), ln.Addr()
 }
 
 type tlsConfig struct {
@@ -1935,13 +1965,6 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 		extra, ok := ra.getExtraForAddr(string(cfg.Servers[i].Address))
 		if ok {
 			data = append(data, "resolved", extra.remoteAddr)
-			if extra.reachable {
-				data = append(data, "reachable", "yes")
-			} else {
-				data = append(data, "reachable", "no")
-			}
-		} else {
-			data = append(data, "reachable", "unknown")
 		}
 		servers = append(servers, data)
 	}

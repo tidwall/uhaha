@@ -43,9 +43,14 @@ func run(cmd string, args ...string) string {
 		} else {
 			wlog("::RUN::FAIL::%s\n", err)
 		}
-		panic("bad news")
+		badnews()
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func badnews() {
+	println("bad news")
+	os.Exit(1)
 }
 
 func killAll() {
@@ -60,7 +65,7 @@ func verifyGoVersion() {
 	rvers := run("go", "version")
 	if rvers != lvers {
 		wlog("::VERSION::Mismatch::'%s' != '%s'", rvers, lvers)
-		panic("bad news")
+		badnews()
 	}
 	wlog("::VERSION::Ok\n")
 }
@@ -146,13 +151,12 @@ func startInstance(num, size int, wg *sync.WaitGroup) *instance {
 			line, err := brd.ReadString('\n')
 			if err != nil {
 				wlog("::INST::%d/%d::ERROR::%s", num, size, err)
-				panic("bad news")
+				badnews()
 			}
-			f.WriteString(line)
 			line = strings.TrimSpace(line)
 			if strings.Contains(line, "logs loaded: ready for commands") {
 				readyCh <- true
-				io.Copy(f, rd)
+				io.Copy(ioutil.Discard, brd)
 				break
 			}
 		}
@@ -165,7 +169,7 @@ func startInstance(num, size int, wg *sync.WaitGroup) *instance {
 			ready = true
 		case <-tick.C:
 			wlog("::INST::%d/%d::TIMEOUT", num, size)
-			panic("bad news")
+			badnews()
 		}
 	}
 	wlog("::INST::%d/%d::Started", num, size)
@@ -283,14 +287,14 @@ func openConn(size int) *tconn {
 			if err == nil {
 				if reply != "PONG" {
 					wlog("::CLIENT::Expected 'PONG' got '%s'", reply)
-					panic("bad news")
+					badnews()
 				}
 				break
 			}
 		}
 		if time.Since(start) > time.Second*10 {
 			wlog("::CLIENT::%s", err)
-			panic("bad news")
+			badnews()
 		}
 	}
 	return c
@@ -303,7 +307,7 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 		if err != nil {
 			if time.Since(start) > time.Second*10 {
 				wlog("::CLIENT::%s", err)
-				panic("bad news")
+				badnews()
 			}
 			// if isNotLeaderErr(err) {
 			c.conn.Close()
@@ -312,7 +316,7 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 			continue
 			// }
 			// wlog("::CLIENT::%s\n", err)
-			// panic("bad news")
+			// badnews()
 		}
 		return reply
 	}
@@ -340,7 +344,7 @@ func execClient(
 				fmt.Printf("%v\n", err)
 				// continue
 				wlog("::CLIENT::Invalid reply '%s'", reply)
-				panic("bad news")
+				badnews()
 			}
 			mu.Lock()
 			keys.Set(key, true)
@@ -356,7 +360,7 @@ func execClient(
 			reply, _ := redis.Int(c.do("DEL", key), nil)
 			if reply != 1 && reply != 0 {
 				wlog("::CLIENT::Invalid reply '%d'", reply)
-				panic("bad news")
+				badnews()
 			}
 			mu.Lock()
 			*deleted += int(reply)
