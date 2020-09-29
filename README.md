@@ -197,7 +197,7 @@ Now you have a raft cluster running on three distinct servers in the same local 
 If you want to lock down the cluster further you can provide a secret auth, which is more or less a password that the cluster and client will need to communicate with each other.
 
 ```sh
-./ticket -n 1 -a 10.0.0.1:11001 --auth my-secrect-token
+./ticket -n 1 -a 10.0.0.1:11001 --auth my-secret-token
 ```
 
 All the servers will need to be started with the same auth.
@@ -232,7 +232,7 @@ mkcert uhaha-example
 Then create a cluster using the cert & key files. Along with an auth.
 
 ```sh
-./ticket -n 1 -a 10.0.0.1:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secrect-token
+./ticket -n 1 -a 10.0.0.1:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token
 ```
 
 ```sh
