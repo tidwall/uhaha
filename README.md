@@ -162,11 +162,100 @@ RAFT SNAPSHOT FILE id                   # show the file path of a snapshot on se
 RAFT SNAPSHOT READ id [RANGE start end] # download all or part of a snapshot
 ```
 
+## Network and security considerations (TLS and Auth tokens)
+
+By default a single Uhaha instance is bound to the local `127.0.0.1` IP address. Thus the nothing outside that machine including the other servers in the cluster or machines on the same local network will be able communicate with this instance. 
+
+### Network security
+
+To open up the service you will need to provide an IP address that can be reached by the outside.
+For example, let's say you want to set up three servers on a local `10.0.0.0` network.
+
+On server 1:
+
+```sh
+./ticket -n 1 -a 10.0.0.1:11001
+```
+
+On server 2:
+
+```sh
+./ticket -n 2 -a 10.0.0.2:11001 -j 10.0.0.1:11001
+```
+
+On server 3:
+
+```sh
+./ticket -n 3 -a 10.0.0.3:11001 -j 10.0.0.1:11001
+```
+
+Now you have a raft cluster running on three distinct servers in the same local network. This may be enough for applications that only require a [network security policy](https://en.wikipedia.org/wiki/Network_security). Basically any server on the local network can access the cluster.
+
+### Auth token (password)
+
+If you want to lock down the cluster further you can provide a secret auth token, which is more or less a password that the cluster and client will need to communicate with each other.
+
+```sh
+./ticket -n 1 -a 10.0.0.1:11001 --auth my-secrect-token
+```
+
+All the servers will need to be started with the same auth.
+
+```sh
+./ticket -n 2 -a 10.0.0.2:11001 --auth my-secret-token -j 10.0.0.1:11001
+```
+
+```sh
+./ticket -n 2 -a 10.0.0.3:11001 --auth my-secret-token -j 10.0.0.1:11001
+```
+
+The client will also need the same auth to talk with cluster. All redis clients support an auth password, such as:
+
+```sh
+redis-cli -h 10.0.0.1 -p 11001 -a my-secret-token
+```
+
+This may be enough if you keep all your machines on the same private network, but you don't want all machines or applications to have unfettered access to the cluster.
+
+### TLS
+
+Finally you can use TLS, which I recommend along with an auth password.
+
+In this example a custom cert and key are created using the [`mkcert`](https://github.com/FiloSottile/mkcert) tool.
+
+```sh
+mkcert uhaha-example
+# produces uhaha-example.pem, uhaha-example-key.pem, and a rootCA.pem
+```
+
+Then create a cluster using the cert & key files. Along with an auth.
+
+```sh
+./ticket -n 1 -a 10.0.0.1:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secrect-token
+```
+
+```sh
+./ticket -n 2 -a 10.0.0.2:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token -j 10.0.0.1:11001
+```
+
+```sh
+./ticket -n 2 -a 10.0.0.3:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token -j 10.0.0.1:11001
+```
+
+Finally you can connect to the server from a client that has the `rootCA.pem`.
+
+```sh
+redis-cli -h 10.0.0.1 -p 11001 --tls --cacert rootCA.pem -a my-secret-token
+```
+
+Yay 🎉. Super secure!
+
+
 ## Command-line options
 
-```
-my-uhaha-app version: 0.0.0
+Below are all of the command line options.
 
+```
 Usage: my-uhaha-app [-n id] [-a addr] [options]
 
 Basic options:
@@ -181,8 +270,6 @@ Basic options:
 Security options:
   --tls-cert path : path to TLS certificate
   --tls-key path  : path to TLS private key
-  --tls-ca path   : path to CA certificate to be used as a trusted root when 
-                    validating certificates.
   --auth auth     : cluster authorization, shared by all servers and clients
 
 Advanced options:
@@ -200,5 +287,13 @@ Advanced options:
                     initial data. The other nodes must be re-joined. This
                     operation is ignored when a data directory already exists.
                     Cannot be used with -j flag.
+  --preserve-addr : preserve original address from -a flag for all raft and
+                    client broadcasting. This is useful if you rely on domain
+                    ip address resolution at runtime or have a complexly
+                    orchestrated network.
 ```
+
+
+
+
 
