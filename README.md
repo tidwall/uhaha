@@ -22,6 +22,7 @@ and other stuff too.
 - APIs for building custom services such as HTTP and gRPC. 
   Supports the Redis protocol by default, so any Redis-compatible client
   library will work with Uhaha.
+- [TLS](#tls) and [Auth password](#auth-password) support.
 - Multiple examples to help jumpstart integration, including
   a [Key-value DB](https://github.com/tidwall/uhaha/tree/master/examples/kvdb), 
   a [Timeseries DB](https://github.com/tidwall/uhaha/tree/master/examples/timeseries), 
@@ -162,7 +163,7 @@ RAFT SNAPSHOT FILE id                   # show the file path of a snapshot on se
 RAFT SNAPSHOT READ id [RANGE start end] # download all or part of a snapshot
 ```
 
-## Network and security considerations (TLS and Auth tokens)
+## Network and security considerations (TLS and Auth password)
 
 By default a single Uhaha instance is bound to the local `127.0.0.1` IP address. Thus the nothing outside that machine including the other servers in the cluster or machines on the same local network will be able communicate with this instance. 
 
@@ -191,9 +192,9 @@ On server 3:
 
 Now you have a raft cluster running on three distinct servers in the same local network. This may be enough for applications that only require a [network security policy](https://en.wikipedia.org/wiki/Network_security). Basically any server on the local network can access the cluster.
 
-### Auth token (password)
+### Auth password
 
-If you want to lock down the cluster further you can provide a secret auth token, which is more or less a password that the cluster and client will need to communicate with each other.
+If you want to lock down the cluster further you can provide a secret auth, which is more or less a password that the cluster and client will need to communicate with each other.
 
 ```sh
 ./ticket -n 1 -a 10.0.0.1:11001 --auth my-secrect-token
