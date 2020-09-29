@@ -86,8 +86,6 @@ Basic options:
 Security options:
   --tls-cert path : path to TLS certificate
   --tls-key path  : path to TLS private key
-  --tls-ca path   : path to CA certificate to be used as a trusted root when 
-                    validating certificates.
   --auth auth     : cluster authorization, shared by all servers and clients
 
 Advanced options:
@@ -186,25 +184,24 @@ type Config struct {
 	// connection has been closed on this machine.
 	ConnClosed func(context interface{}, addr string)
 
-	LocalTime     bool          // default false
-	TickDelay     time.Duration // default 200ms
-	BackupPath    string        // default ""
-	InitialData   interface{}   // default nil
-	NodeID        string        // default "1"
-	Addr          string        // default ":11001"
-	DataDir       string        // default "data"
-	LogOutput     io.Writer     // default os.Stderr
-	LogLevel      string        // default "notice"
-	JoinAddr      string        // default ""
-	Backend       Backend       // default LevelDB
-	NoSync        bool          // default false
-	OpenReads     bool          // default false
-	MaxPool       int           // default 8
-	TLSCertPath   string        // default ""
-	TLSKeyPath    string        // default ""
-	TLSCACertPath string        // default ""
-	Auth          string        // default ""
-	PreseveAddr   bool          // default false
+	LocalTime   bool          // default false
+	TickDelay   time.Duration // default 200ms
+	BackupPath  string        // default ""
+	InitialData interface{}   // default nil
+	NodeID      string        // default "1"
+	Addr        string        // default ":11001"
+	DataDir     string        // default "data"
+	LogOutput   io.Writer     // default os.Stderr
+	LogLevel    string        // default "notice"
+	JoinAddr    string        // default ""
+	Backend     Backend       // default LevelDB
+	NoSync      bool          // default false
+	OpenReads   bool          // default false
+	MaxPool     int           // default 8
+	TLSCertPath string        // default ""
+	TLSKeyPath  string        // default ""
+	Auth        string        // default ""
+	PreseveAddr bool          // default false
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -293,7 +290,6 @@ func confInit(conf *Config) {
 	flag.StringVar(&backend, "backend", "leveldb", "")
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
 	flag.StringVar(&conf.TLSKeyPath, "tls-key", conf.TLSKeyPath, "")
-	flag.StringVar(&conf.TLSCACertPath, "tls-ca", conf.TLSCACertPath, "")
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
 	flag.BoolVar(&conf.OpenReads, "openreads", conf.OpenReads, "")
 	flag.StringVar(&conf.BackupPath, "restore", conf.BackupPath, "")
@@ -331,6 +327,15 @@ func confInit(conf *Config) {
 	case "":
 	default:
 		fmt.Fprintf(os.Stderr, "invalid usage of test flag -t\n")
+		os.Exit(1)
+	}
+	if conf.TLSCertPath != "" && conf.TLSKeyPath == "" {
+		fmt.Fprintf(os.Stderr,
+			"flag --tls-key cannot be empty when --tls-cert is provided\n")
+		os.Exit(1)
+	} else if conf.TLSCertPath == "" && conf.TLSKeyPath != "" {
+		fmt.Fprintf(os.Stderr,
+			"flag --tls-cert cannot be empty when --tls-key is provided\n")
 		os.Exit(1)
 	}
 	if conf.Flag.PostParse != nil {
@@ -749,7 +754,7 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 // the server already belongs to a cluster or if the server is bootstrapping
 // then this operation is ignored.
 func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
-	tlscfg *tlsConfig, log *redlog.Logger,
+	tlscfg *tls.Config, log *redlog.Logger,
 ) {
 	// Get the current Raft cluster configuration for determining whether this
 	// server needs to bootstrap a new cluster, or join/re-join an existing
@@ -837,11 +842,12 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 // redisDial simply dials out to another Uhaha server with redis protocol and
 // using the provded TLS config and Auth token. The TLS/Auth must be correct
 // in order to establish a connection.
-func redisDial(addr, auth string, tlscfg *tlsConfig) (redis.Conn, error) {
+func redisDial(addr, auth string, tlscfg *tls.Config) (redis.Conn, error) {
 	var conn redis.Conn
 	var err error
-	if tlscfg.client != nil {
-		conn, err = redis.Dial("tcp", addr, redis.DialTLSConfig(tlscfg.client))
+	if tlscfg != nil {
+		conn, err = redis.Dial("tcp", addr,
+			redis.DialUseTLS(true), redis.DialTLSConfig(tlscfg))
 	} else {
 		conn, err = redis.Dial("tcp", addr)
 	}
@@ -1058,7 +1064,7 @@ func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
 
 var errLeaderUnknown = errors.New("leader unknown")
 
-func getClusterLastIndex(ra *raftWrap, tlscfg *tlsConfig, auth string,
+func getClusterLastIndex(ra *raftWrap, tlscfg *tls.Config, auth string,
 ) (uint64, error) {
 	if ra.State() == raft.Leader {
 		return ra.LastIndex(), nil
@@ -1089,7 +1095,7 @@ func getClusterLastIndex(ra *raftWrap, tlscfg *tlsConfig, auth string,
 // runLogLoadedPoller is a background routine that reports on raft log progress
 // and also maintains the m.logLoaded atomic boolean for open read systems.
 func runLogLoadedPoller(conf Config, m *machine, ra *raftWrap,
-	tlscfg *tlsConfig, log *redlog.Logger,
+	tlscfg *tls.Config, log *redlog.Logger,
 ) {
 	var loaded bool
 	var lastPerc string
@@ -1201,21 +1207,21 @@ const transportMarker = "8e35747e37d192d9a819021ba2a02909"
 type transportStream struct {
 	net.Listener
 	auth   string
-	tlscfg *tlsConfig
+	tlscfg *tls.Config
 }
 
 func (s *transportStream) Dial(addr raft.ServerAddress, timeout time.Duration,
 ) (conn net.Conn, err error) {
 	if timeout <= 0 {
-		if s.tlscfg.client != nil {
-			conn, err = tls.Dial("tcp", string(addr), s.tlscfg.client)
+		if s.tlscfg != nil {
+			conn, err = tls.Dial("tcp", string(addr), s.tlscfg)
 		} else {
 			conn, err = net.Dial("tcp", string(addr))
 		}
 	} else {
-		if s.tlscfg.client != nil {
+		if s.tlscfg != nil {
 			conn, err = tls.DialWithDialer(&net.Dialer{Timeout: timeout},
-				"tcp", string(addr), s.tlscfg.client)
+				"tcp", string(addr), s.tlscfg)
 		} else {
 			conn, err = net.DialTimeout("tcp", string(addr), timeout)
 		}
@@ -1234,7 +1240,7 @@ func (s *transportStream) Dial(addr raft.ServerAddress, timeout time.Duration,
 	return conn, nil
 }
 
-func transportInit(conf Config, tlscfg *tlsConfig, svr *splitServer,
+func transportInit(conf Config, tlscfg *tls.Config, svr *splitServer,
 	hclogger hclog.Logger, log *redlog.Logger,
 ) raft.Transport {
 	ln := svr.split(func(r io.Reader) (n int, ok bool) {
@@ -1260,12 +1266,12 @@ func transportInit(conf Config, tlscfg *tlsConfig, svr *splitServer,
 	return raft.NewNetworkTransport(stream, conf.MaxPool, 0, log)
 }
 
-func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
+func serverInit(conf Config, tlscfg *tls.Config, log *redlog.Logger,
 ) (*splitServer, net.Addr) {
 	var ln net.Listener
 	var err error
-	if tlscfg.server != nil {
-		ln, err = tls.Listen("tcp", conf.Addr, tlscfg.server)
+	if tlscfg != nil {
+		ln, err = tls.Listen("tcp", conf.Addr, tlscfg)
 	} else {
 		ln, err = net.Listen("tcp", conf.Addr)
 	}
@@ -1279,38 +1285,34 @@ func serverInit(conf Config, tlscfg *tlsConfig, log *redlog.Logger,
 	return newSplitServer(ln, log), ln.Addr()
 }
 
-type tlsConfig struct {
-	client *tls.Config
-	server *tls.Config
-}
-
-func tlsInit(conf Config, log *redlog.Logger) *tlsConfig {
-	tlscfg := new(tlsConfig)
-	if conf.TLSCertPath != "" || conf.TLSKeyPath != "" {
-		if conf.TLSCertPath == "" {
-			log.Fatal("tls: missing cert file")
-		}
-		if conf.TLSKeyPath == "" {
-			log.Fatal("tls: missing key file")
-		}
-		cer, err := tls.LoadX509KeyPair(conf.TLSCertPath, conf.TLSKeyPath)
+func parseTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	tlscfg := &tls.Config{
+		Certificates: []tls.Certificate{pair},
+	}
+	for _, cert := range pair.Certificate {
+		pcert, err := x509.ParseCertificate(cert)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
-		tlscfg.server = &tls.Config{
-			Certificates: []tls.Certificate{cer},
+		if len(pcert.DNSNames) > 0 {
+			tlscfg.ServerName = pcert.DNSNames[0]
+			break
 		}
 	}
-	if conf.TLSCACertPath != "" {
-		data, err := ioutil.ReadFile(conf.TLSCertPath)
-		if err != nil {
-			log.Fatal(err)
-		}
-		certpool := x509.NewCertPool()
-		certpool.AppendCertsFromPEM(data)
-		tlscfg.client = &tls.Config{
-			RootCAs: certpool,
-		}
+	return tlscfg, nil
+}
+
+func tlsInit(conf Config, log *redlog.Logger) *tls.Config {
+	if conf.TLSCertPath == "" || conf.TLSKeyPath == "" {
+		return nil
+	}
+	tlscfg, err := parseTLSConfig(conf.TLSCertPath, conf.TLSKeyPath)
+	if err != nil {
+		log.Fatal(err)
 	}
 	return tlscfg
 }

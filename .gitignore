@@ -1,6 +1,3 @@
 /data*
-# /uhaha
-/tls
 testing/
-examples/redis/
-examples/tinykvdb/
+*.pem
