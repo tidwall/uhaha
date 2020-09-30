@@ -625,6 +625,7 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 ) *machine {
 	m := new(machine)
 	m.dir = dir
+	m.vers = versline(conf)
 	m.tickedSig = sync.NewCond(&m.mu)
 	m.created = time.Now().UnixNano()
 	m.wrC = make(chan *writeRequestFuture, 1024)
@@ -650,6 +651,7 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 		"tick":    command{'w', cmdTICK},
 		"raft":    command{'s', cmdRAFT},
 		"machine": command{'r', cmdMACHINE},
+		"version": command{'s', cmdVERSION},
 	}
 	for k, v := range conf.cmds {
 		if _, ok := m.commands[k]; !ok {
@@ -1620,6 +1622,7 @@ type machine struct {
 	jsonType   reflect.Type       //
 	snaps      raft.SnapshotStore //
 	dir        string             //
+	vers       string             // version line
 	tick       func(m Machine)    //
 	created    int64              // machine instance created timestamp
 	commands   map[string]command // command table
@@ -2261,6 +2264,14 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 		"RAFT SNAPSHOT READ id [RANGE start end]",
 	}
 	return lines, nil
+}
+
+// VERSION
+func cmdVERSION(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+	if len(args) != 1 {
+		return nil, ErrWrongNumArgs
+	}
+	return getBaseMachine(um).vers, nil
 }
 
 // MACHINE [HUMAN]
