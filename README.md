@@ -11,7 +11,7 @@
 Uhaha is a framework for building highly available data applications in Go. 
 This is bascially an upgrade to my [Finn](https://github.com/tidwall/finn)
 project, which was good but Uhaha is gooder because Uhaha has more security
-features (TLS and auth tokens), customizable services, deterministic time,
+features (TLS and auth passwords), customizable services, deterministic time,
 recalculable random numbers, simpler snapshots, a smaller network footprint,
 and other stuff too.  
 
@@ -151,7 +151,8 @@ than the previous TICKET command.
 There are a number built-in commands for managing and monitor the cluster.
 
 ```sh
-MACHINE                                 # show information about the machine
+VERSION                                 # show the application version
+MACHINE                                 # show information about the state machine
 RAFT LEADER                             # show the address of the current raft leader
 RAFT INFO [pattern]                     # show information about the raft server and cluster
 RAFT SERVER LIST                        # show all servers in cluster
@@ -161,6 +162,15 @@ RAFT SNAPSHOT NOW                       # make a snapshot of the data
 RAFT SNAPSHOT LIST                      # show a list of all snapshots on server
 RAFT SNAPSHOT FILE id                   # show the file path of a snapshot on server
 RAFT SNAPSHOT READ id [RANGE start end] # download all or part of a snapshot
+```
+
+And also some client commands.
+
+```sh
+QUIT                                    # close the client connection
+PING                                    # ping the server
+ECHO [message]                          # echo a message to the server
+AUTH password                           # authenticate with a password
 ```
 
 ## Network and security considerations (TLS and Auth password)
@@ -197,23 +207,23 @@ Now you have a raft cluster running on three distinct servers in the same local 
 If you want to lock down the cluster further you can provide a secret auth, which is more or less a password that the cluster and client will need to communicate with each other.
 
 ```sh
-./ticket -n 1 -a 10.0.0.1:11001 --auth my-secret-token
+./ticket -n 1 -a 10.0.0.1:11001 --auth my-secret
 ```
 
 All the servers will need to be started with the same auth.
 
 ```sh
-./ticket -n 2 -a 10.0.0.2:11001 --auth my-secret-token -j 10.0.0.1:11001
+./ticket -n 2 -a 10.0.0.2:11001 --auth my-secret -j 10.0.0.1:11001
 ```
 
 ```sh
-./ticket -n 2 -a 10.0.0.3:11001 --auth my-secret-token -j 10.0.0.1:11001
+./ticket -n 2 -a 10.0.0.3:11001 --auth my-secret -j 10.0.0.1:11001
 ```
 
 The client will also need the same auth to talk with cluster. All redis clients support an auth password, such as:
 
 ```sh
-redis-cli -h 10.0.0.1 -p 11001 -a my-secret-token
+redis-cli -h 10.0.0.1 -p 11001 -a my-secret
 ```
 
 This may be enough if you keep all your machines on the same private network, but you don't want all machines or applications to have unfettered access to the cluster.
@@ -232,21 +242,21 @@ mkcert uhaha-example
 Then create a cluster using the cert & key files. Along with an auth.
 
 ```sh
-./ticket -n 1 -a 10.0.0.1:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token
+./ticket -n 1 -a 10.0.0.1:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret
 ```
 
 ```sh
-./ticket -n 2 -a 10.0.0.2:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token -j 10.0.0.1:11001
+./ticket -n 2 -a 10.0.0.2:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret -j 10.0.0.1:11001
 ```
 
 ```sh
-./ticket -n 2 -a 10.0.0.3:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret-token -j 10.0.0.1:11001
+./ticket -n 2 -a 10.0.0.3:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret -j 10.0.0.1:11001
 ```
 
 Finally you can connect to the server from a client that has the `rootCA.pem`.
 
 ```sh
-redis-cli -h 10.0.0.1 -p 11001 --tls --cacert rootCA.pem -a my-secret-token
+redis-cli -h 10.0.0.1 -p 11001 --tls --cacert rootCA.pem -a my-secret
 ```
 
 Yay 🎉. Super secure!
