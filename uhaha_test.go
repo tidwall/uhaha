@@ -314,7 +314,6 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 		reply, err := c.conn.Do(cmd, args...)
 		if err != nil {
 			if time.Since(start) > time.Second*10 {
-				println(2)
 				wlog("::CLIENT::%s", err)
 				badnews()
 			}
