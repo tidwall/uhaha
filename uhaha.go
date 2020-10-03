@@ -820,20 +820,24 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 		}
 		if ra.advertise != "" {
 			// Check that the address is the same as before
+			found := false
 			same := true
-			before := conf.Addr
+			before := ra.advertise
 			for _, s := range servers {
 				if string(s.ID) == conf.NodeID {
-					if string(s.Address) != conf.Addr {
+					found = true
+					if string(s.Address) != ra.advertise {
 						same = false
 						before = string(s.Address)
 						break
 					}
 				}
 			}
-			if !same {
+			if !found {
+				log.Fatalf("advertise address changed but node not found\n")
+			} else if !same {
 				log.Fatalf("advertise address change from \"%s\" to \"%s\" ",
-					before, conf.Addr)
+					before, ra.advertise)
 			}
 		}
 	}
@@ -958,7 +962,6 @@ func runMaintainServers(ra *raftWrap) {
 					extra.broadcast = addr
 				}
 				ra.extra[addr] = extra
-
 			}(string(svr.Address))
 		}
 		wg.Wait()
@@ -1963,11 +1966,11 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 	for i := 0; i < len(cfg.Servers); i++ {
 		data := []string{"id", string(cfg.Servers[i].ID)}
 		extra, ok := ra.getExtraForAddr(string(cfg.Servers[i].Address))
-		data = append(data, "advertise", string(cfg.Servers[i].Address))
+		data = append(data, "address", string(cfg.Servers[i].Address))
 		if ok {
-			data = append(data, "bind", extra.remoteAddr)
+			data = append(data, "resolve", extra.remoteAddr)
 		} else {
-			data = append(data, "bind", string(cfg.Servers[i].Address))
+			data = append(data, "resolve", string(cfg.Servers[i].Address))
 		}
 		servers = append(servers, data)
 	}
