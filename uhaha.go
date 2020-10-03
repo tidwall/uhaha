@@ -2738,24 +2738,11 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 		case "quit":
 			r = Response(redisQuitClose{}, 0, nil)
 			close = true
-		case "ping":
-			if len(args) == 1 {
-				r = Response(redcon.SimpleString("PONG"), 0, nil)
-			} else if len(args) == 2 {
-				r = Response(args[1], 0, nil)
-			} else {
-				r = Response(nil, 0, ErrWrongNumArgs)
-			}
-		case "echo":
-			if len(args) != 2 {
-				r = Response(nil, 0, ErrWrongNumArgs)
-			} else {
-				r = Response(args[1], 0, nil)
-			}
 		case "auth":
 			if len(args) != 2 {
 				r = Response(nil, 0, ErrWrongNumArgs)
 			} else if err := s.Auth(args[1]); err != nil {
+				client.authorized = false
 				r = Response(nil, 0, err)
 			} else {
 				client.authorized = true
@@ -2764,13 +2751,31 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 		default:
 			if !client.authorized {
 				if err := s.Auth(""); err != nil {
+					client.authorized = false
 					r = Response(nil, 0, err)
 				} else {
 					client.authorized = true
 					r = s.Send(args, &client.opts)
 				}
 			} else {
-				r = s.Send(args, &client.opts)
+				switch args[0] {
+				case "ping":
+					if len(args) == 1 {
+						r = Response(redcon.SimpleString("PONG"), 0, nil)
+					} else if len(args) == 2 {
+						r = Response(args[1], 0, nil)
+					} else {
+						r = Response(nil, 0, ErrWrongNumArgs)
+					}
+				case "echo":
+					if len(args) != 2 {
+						r = Response(nil, 0, ErrWrongNumArgs)
+					} else {
+						r = Response(args[1], 0, nil)
+					}
+				default:
+					r = s.Send(args, &client.opts)
+				}
 			}
 		}
 		recvs[i] = r
