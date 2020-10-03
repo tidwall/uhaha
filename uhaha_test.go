@@ -113,6 +113,7 @@ type instance struct {
 }
 
 func startInstance(num, size int, wg *sync.WaitGroup) *instance {
+	output := os.Getenv("OUTPUT_LOGS") != ""
 	inst := &instance{num: num, size: size}
 	inst.wg.Add(1)
 	path, err := ioutil.TempDir("", "")
@@ -153,10 +154,17 @@ func startInstance(num, size int, wg *sync.WaitGroup) *instance {
 				wlog("::INST::%d/%d::ERROR::%s", num, size, err)
 				badnews()
 			}
+			if output {
+				os.Stdout.WriteString(line)
+			}
 			line = strings.TrimSpace(line)
 			if strings.Contains(line, "logs loaded: ready for commands") {
 				readyCh <- true
-				io.Copy(ioutil.Discard, brd)
+				if output {
+					io.Copy(os.Stdout, brd)
+				} else {
+					io.Copy(ioutil.Discard, brd)
+				}
 				break
 			}
 		}
@@ -306,6 +314,7 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 		reply, err := c.conn.Do(cmd, args...)
 		if err != nil {
 			if time.Since(start) > time.Second*10 {
+				println(2)
 				wlog("::CLIENT::%s", err)
 				badnews()
 			}
@@ -314,9 +323,6 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 			nc := openConn(c.size)
 			c.conn = nc.conn
 			continue
-			// }
-			// wlog("::CLIENT::%s\n", err)
-			// badnews()
 		}
 		return reply
 	}

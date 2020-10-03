@@ -1961,13 +1961,13 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 	cfg := f.Configuration()
 	var servers [][]string
 	for i := 0; i < len(cfg.Servers); i++ {
-		data := []string{
-			"id", string(cfg.Servers[i].ID),
-			"address", string(cfg.Servers[i].Address),
-		}
+		data := []string{"id", string(cfg.Servers[i].ID)}
 		extra, ok := ra.getExtraForAddr(string(cfg.Servers[i].Address))
+		data = append(data, "advertise", string(cfg.Servers[i].Address))
 		if ok {
-			data = append(data, "resolved", extra.remoteAddr)
+			data = append(data, "bind", extra.remoteAddr)
+		} else {
+			data = append(data, "bind", string(cfg.Servers[i].Address))
 		}
 		servers = append(servers, data)
 	}
@@ -2753,9 +2753,9 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 					r = Response(nil, 0, err)
 				} else {
 					client.authorized = true
-					r = s.Send(args, &client.opts)
 				}
-			} else {
+			}
+			if client.authorized {
 				switch args[0] {
 				case "ping":
 					if len(args) == 1 {
