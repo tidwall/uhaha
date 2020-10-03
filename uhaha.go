@@ -75,38 +75,37 @@ const usage = `{{NAME}} version: {{VERSION}} ({{GITSHA}})
 Usage: {{NAME}} [-n id] [-a addr] [options]
 
 Basic options:
-  -v              : display version
-  -h              : display help, this screen
-  -a addr         : bind to address  (default: 127.0.0.1:11001)
-  -n id           : node ID  (default: 1)
-  -d dir          : data directory  (default: data)
-  -j addr         : leader address of a cluster to join
-  -l level        : log level  (default: notice) [debug,verb,notice,warn,silent]
+  -v               : display version
+  -h               : display help, this screen
+  -a addr          : bind to address  (default: 127.0.0.1:11001)
+  -n id            : node ID  (default: 1)
+  -d dir           : data directory  (default: data)
+  -j addr          : leader address of a cluster to join
+  -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
-  --tls-cert path : path to TLS certificate
-  --tls-key path  : path to TLS private key
-  --auth auth     : cluster authorization, shared by all servers and clients
+  --tls-cert path  : path to TLS certificate
+  --tls-key path   : path to TLS private key
+  --auth auth      : cluster authorization, shared by all servers and clients
+
+Networking options: 
+  --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
-  --nosync        : turn off syncing data to disk after every write. This leads
-                    to faster write operations but opens up the chance for data
-                    loss due to catastrophic events such as power failure.
-  --openreads     : allow followers to process read commands, but with the 
-                    possibility of returning stale data.
-  --localtime     : have the raft machine time synchronized with the local
-                    server rather than the public internet. This will run the 
-                    risk of time shifts when the local server time is
-                    drastically changed during live operation. 
-  --restore path  : restore a raft machine from a snapshot file. This will
-                    start a brand new single-node cluster using the snapshot as
-                    initial data. The other nodes must be re-joined. This
-                    operation is ignored when a data directory already exists.
-                    Cannot be used with -j flag.
-  --preserve-addr : preserve original address from -a flag for all raft and
-                    client broadcasting. This is useful if you rely on domain
-                    ip address resolution at runtime or have a complexly
-                    orchestrated network.
+  --nosync         : turn off syncing data to disk after every write. This leads
+                     to faster write operations but opens up the chance for data
+                     loss due to catastrophic events such as power failure.
+  --openreads      : allow followers to process read commands, but with the 
+                     possibility of returning stale data.
+  --localtime      : have the raft machine time synchronized with the local
+                     server rather than the public internet. This will run the 
+                     risk of time shifts when the local server time is
+                     drastically changed during live operation. 
+  --restore path   : restore a raft machine from a snapshot file. This will
+                     start a brand new single-node cluster using the snapshot as
+                     initial data. The other nodes must be re-joined. This
+                     operation is ignored when a data directory already exists.
+                     Cannot be used with -j flag.
 `
 
 // Config is the configuration for managing the behavior of the application.
@@ -201,7 +200,7 @@ type Config struct {
 	TLSCertPath string        // default ""
 	TLSKeyPath  string        // default ""
 	Auth        string        // default ""
-	PreseveAddr bool          // default false
+	Advertise   string        // default ""
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -234,7 +233,7 @@ func (conf *Config) def() {
 		conf.DataDir = "data"
 	}
 	if conf.LogLevel == "" {
-		conf.LogLevel = "notice"
+		conf.LogLevel = "info"
 	}
 	if conf.LogOutput == nil {
 		conf.LogOutput = os.Stderr
@@ -295,7 +294,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.BackupPath, "restore", conf.BackupPath, "")
 	flag.BoolVar(&conf.LocalTime, "localtime", conf.LocalTime, "")
 	flag.StringVar(&conf.Auth, "auth", conf.Auth, "")
-	flag.BoolVar(&conf.PreseveAddr, "preserve-addr", conf.PreseveAddr, "")
+	flag.StringVar(&conf.Advertise, "advertise", conf.Advertise, "")
 	flag.StringVar(&testNode, "t", "", "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
@@ -473,7 +472,7 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 		lopts.Level = 0
 	case "verbose", "verb":
 		lopts.Level = 1
-	case "notice":
+	case "notice", "info":
 		lopts.Level = 2
 	case "warning", "warn":
 		lopts.Level = 3
@@ -747,8 +746,8 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 		log.Fatal(err)
 	}
 	return &raftWrap{
-		Raft:         ra,
-		preserveAddr: conf.PreseveAddr,
+		Raft:      ra,
+		advertise: conf.Advertise,
 	}
 }
 
@@ -766,8 +765,8 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 		log.Fatalf("could not get Raft configuration: %v", err)
 	}
 	var addrStr string
-	if ra.preserveAddr {
-		addrStr = conf.Addr
+	if ra.advertise != "" {
+		addrStr = conf.Advertise
 	} else {
 		addrStr = addr.String()
 	}
@@ -819,7 +818,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 			log.Warningf("ignoring join request because server already " +
 				"belongs to a cluster")
 		}
-		if ra.preserveAddr {
+		if ra.advertise != "" {
 			// Check that the address is the same as before
 			same := true
 			before := conf.Addr
@@ -833,8 +832,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 				}
 			}
 			if !same {
-				log.Warningf("broadcast address change from \"%s\" to \"%s\" "+
-					"is ignored",
+				log.Fatalf("advertise address change from \"%s\" to \"%s\" ",
 					before, conf.Addr)
 			}
 		}
@@ -904,13 +902,13 @@ type serverExtra struct {
 
 type raftWrap struct {
 	*raft.Raft
-	preserveAddr bool
-	mu           sync.RWMutex
-	extra        map[string]serverExtra
+	advertise string
+	mu        sync.RWMutex
+	extra     map[string]serverExtra
 }
 
 func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
-	if !ra.preserveAddr {
+	if ra.advertise == "" {
 		return extra, false
 	}
 	ra.mu.RLock()
@@ -925,7 +923,7 @@ func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
 }
 
 func runMaintainServers(ra *raftWrap) {
-	if !ra.preserveAddr {
+	if ra.advertise == "" {
 		return
 	}
 	for {
@@ -970,7 +968,7 @@ func runMaintainServers(ra *raftWrap) {
 
 func getLeaderBroadcastAddr(ra *raftWrap) string {
 	leader := string(ra.Leader())
-	if !ra.preserveAddr {
+	if ra.advertise == "" {
 		return leader
 	}
 	if leader == "" {
@@ -1281,8 +1279,8 @@ func serverInit(conf Config, tlscfg *tls.Config, log *redlog.Logger,
 		log.Fatal(err)
 	}
 	log.Printf("server listening at %s", ln.Addr())
-	if conf.PreseveAddr {
-		log.Printf("server broadcasting at %s", conf.Addr)
+	if conf.Advertise != "" {
+		log.Printf("server advertising as %s", conf.Advertise)
 	}
 	return newSplitServer(ln, log), ln.Addr()
 }
