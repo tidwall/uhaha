@@ -372,9 +372,9 @@ func (conf *Config) addCommand(kind byte, name string,
 	}}
 }
 
-// AddCatchallCommand adds a passive command that will execute for any input
-// that was not previously defined with AddPassiveCommand, AddWriteCommand, or
-// AddReadCommand.
+// AddCatchallCommand adds a intermediate command that will execute for any
+// input that was not previously defined with AddIntermediateCommand,
+// AddWriteCommand, or AddReadCommand.
 func (conf *Config) AddCatchallCommand(
 	fn func(m Machine, args []string) (interface{}, error),
 ) {
@@ -384,10 +384,10 @@ func (conf *Config) AddCatchallCommand(
 	}}
 }
 
-// AddPassiveCommand adds a command that is for peforming client and system
+// AddIntermediateCommand adds a command that is for peforming client and system
 // specific operations. It *is not* intended for working with the machine data,
 // and doing so will risk data corruption.
-func (conf *Config) AddPassiveCommand(name string,
+func (conf *Config) AddIntermediateCommand(name string,
 	fn func(m Machine, args []string) (interface{}, error),
 ) {
 	conf.addCommand('s', name, fn)
@@ -1573,12 +1573,13 @@ type command struct {
 }
 
 // The Machine interface is passed to every command. It includes the user data
-// and various utilities that should be used from Write, Read, and Passive
+// and various utilities that should be used from Write, Read, and Intermediate
 // commands.
 //
 // It's important to note that the Data(), Now(), and Rand() functions can be
-// used safely for Write and Read commands, but are not available for Passive
-// commands. The Context() is ONLY available for Passive commands.
+// used safely for Write and Read commands, but are not available for
+// Intermediate commands. The Context() is ONLY available for Intermediate
+// commands.
 //
 // A call to Rand() and Now() from inside of a Read command will always return
 // back the same last known value of it's respective type. While, from a Write
@@ -1590,13 +1591,13 @@ type Machine interface {
 	// It's safe to alter the data in this interface while inside a Write
 	// command, but it's only safe to read from this interface for Read
 	// commands.
-	// Returns nil for Passive Commands.
+	// Returns nil for Intermediate Commands.
 	Data() interface{}
 	// Now generates a stable timestamp that is synced with internet time
 	// and for Write commands is always monotonical increasing. It's made to
 	// be a trusted source of time for performing operations on the user data.
 	// Always use this function instead of the builtin time.Now().
-	// Returns nil for Passive Commands.
+	// Returns nil for Intermediate Commands.
 	Now() time.Time
 	// Rand is a random number generator that must be used instead of the
 	// standard Go packages `crypto/rand` and `math/rand`. For Write commands
@@ -1604,12 +1605,12 @@ type Machine interface {
 	// to be reproduced in exact order when the server restarts, and identical
 	// across all machines in the cluster. The underlying implementation is
 	// PCG. Check out http://www.pcg-random.org/ for more information.
-	// Returns nil for Passive Commands.
+	// Returns nil for Intermediate Commands.
 	Rand() Rand
 	// Utility logger for printing information to the local server log.
 	Log() Logger
 	// Context returns the connection context that was defined in from the
-	// Config.ConnOpened callback. Only available for Passive commands.
+	// Config.ConnOpened callback. Only available for Intermediate commands.
 	// Returns nil for Read and Write Commands.
 	Context() interface{}
 }
@@ -1809,23 +1810,23 @@ func (m *machine) Now() time.Time {
 	return time.Unix(0, ts).UTC()
 }
 
-// passiveMachine wraps the machine in a connection context
-type passiveMachine struct {
+// intermediateMachine wraps the machine in a connection context
+type intermediateMachine struct {
 	context interface{}
 	m       *machine
 }
 
-var _ Machine = passiveMachine{}
+var _ Machine = intermediateMachine{}
 
-func (m passiveMachine) Now() time.Time       { return time.Time{} }
-func (m passiveMachine) Context() interface{} { return m.context }
-func (m passiveMachine) Log() Logger          { return m.m.log }
-func (m passiveMachine) Rand() Rand           { return nil }
-func (m passiveMachine) Data() interface{}    { return nil }
+func (m intermediateMachine) Now() time.Time       { return time.Time{} }
+func (m intermediateMachine) Context() interface{} { return m.context }
+func (m intermediateMachine) Log() Logger          { return m.m.log }
+func (m intermediateMachine) Rand() Rand           { return nil }
+func (m intermediateMachine) Data() interface{}    { return nil }
 
 func getBaseMachine(m Machine) *machine {
 	switch m := m.(type) {
-	case passiveMachine:
+	case intermediateMachine:
 		return m.m
 	case *machine:
 		return m
@@ -2568,10 +2569,10 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 		start := time.Now()
 		resp, err := s.execRead(cmd, args, opts)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
-	case 's': // passive/system
+	case 's': // intermediate/system
 		s.waitWrite(opts.From)
 		start := time.Now()
-		pm := passiveMachine{m: s.m, context: opts.Context}
+		pm := intermediateMachine{m: s.m, context: opts.Context}
 		resp, err := cmd.fn(pm, s.ra, args)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:

@@ -37,8 +37,8 @@ func main() {
 	conf.AddReadCommand("get", cmdGET)
 	conf.AddReadCommand("keys", cmdKEYS)
 	conf.AddReadCommand("dbsize", cmdDBSIZE)
-	conf.AddPassiveCommand("monitor", cmdMONITOR)
-	conf.AddPassiveCommand("setrandquote", cmdSETRANDQUOTE)
+	conf.AddIntermediateCommand("monitor", cmdMONITOR)
+	conf.AddIntermediateCommand("setrandquote", cmdSETRANDQUOTE)
 
 	uhaha.Main(conf)
 }
@@ -163,7 +163,7 @@ var quoteURLS = []string{
 // SETRANDQUOTE key
 // help: sets the key to a random quote
 func cmdSETRANDQUOTE(m uhaha.Machine, args []string) (interface{}, error) {
-	// This is running as a passive command, and we intend to translate the
+	// This is running as a intermediate command, and we intend to translate the
 	// arguments using the FilterArgs() type.
 	//
 	// Here we use the standard math/rand package instead of Machine.Rand and
