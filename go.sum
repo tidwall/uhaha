@@ -75,6 +75,8 @@ github.com/tidwall/raft-leveldb v0.1.0 h1:P53g+e1ViUtLqBOqq4BVHymSfFe/XaKh9ozdu9
 github.com/tidwall/raft-leveldb v0.1.0/go.mod h1:KNAMyK8s/oUOTbIL/T07fTL6/EgJfHhK8XeeEPq35eU=
 github.com/tidwall/redcon v1.3.2 h1:8INx/Nm3VSUbDUT16TH1rMgYQsbXNqy9xcX70edHXbo=
 github.com/tidwall/redcon v1.3.2/go.mod h1:bdYBm4rlcWpst2XMwKVzWDF9CoUxEbUmM7CQrKeOZas=
+github.com/tidwall/redcon v1.3.3 h1:BkvIOVPSMw7JnPlyjaSCckgEhvXCy3U5GgKkssveax4=
+github.com/tidwall/redcon v1.3.3/go.mod h1:bdYBm4rlcWpst2XMwKVzWDF9CoUxEbUmM7CQrKeOZas=
 github.com/tidwall/redlog v1.2.1 h1:MeXHP+/+dlFoO6sttzhqGmVTFCCBsHOWKjxsuiPLK5k=
 github.com/tidwall/redlog v2.0.0+incompatible h1:k6lWD+6IJIJ9qkdfcKB2HRKgssBgNtNETnqnrTJgZN8=
 github.com/tidwall/redlog v2.0.0+incompatible/go.mod h1:NssoNA+Uwqd5WHKkVwAzO7AT6VuG3wiC8r5nBqds3Ao=

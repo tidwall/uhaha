@@ -14,7 +14,7 @@ require (
 	github.com/tidwall/gjson v1.6.1
 	github.com/tidwall/match v1.0.1
 	github.com/tidwall/raft-leveldb v0.1.0
-	github.com/tidwall/redcon v1.3.2
+	github.com/tidwall/redcon v1.3.3
 	github.com/tidwall/redlog v2.0.0+incompatible
 	github.com/tidwall/rhh v1.1.0
 	github.com/tidwall/rtime v0.1.2
