@@ -9,7 +9,7 @@
 <p align="center">High Availabilty Framework for Happy Data</p>
 
 Uhaha is a framework for building highly available Raft-based data applications in Go. 
-This is bascially an upgrade to my [Finn](https://github.com/tidwall/finn)
+This is basically an upgrade to my [Finn](https://github.com/tidwall/finn)
 project, which was good but Uhaha is gooder because Uhaha has more security
 features (TLS and auth passwords), customizable services, deterministic time,
 recalculable random numbers, simpler snapshots, a smaller network footprint,
@@ -18,7 +18,7 @@ and other stuff too.
 ## Features
 
 - Simple API for quickly creating a custom Raft-based application.
-- Deterministic monotonic time that does not drift and stays in sync with the internet.
+- Deterministic monotonic time that does not drift and stays in sync with the Internet.
 - APIs for building custom services such as HTTP and gRPC. 
   Supports the Redis protocol by default, so any Redis-compatible client
   library will work with Uhaha.
@@ -175,11 +175,11 @@ AUTH password                           # authenticate with a password
 
 ## Network and security considerations (TLS and Auth password)
 
-By default a single Uhaha instance is bound to the local `127.0.0.1` IP address. Thus the nothing outside that machine including the other servers in the cluster or machines on the same local network will be able communicate with this instance. 
+By default a single Uhaha instance is bound to the local `127.0.0.1` IP address. Thus nothing outside that machine, including other servers in the cluster or machines on the same local network will be able communicate with this instance. 
 
 ### Network security
 
-To open up the service you will need to provide an IP address that can be reached by the outside.
+To open up the service you will need to provide an IP address that can be reached from the outside.
 For example, let's say you want to set up three servers on a local `10.0.0.0` network.
 
 On server 1:
@@ -200,7 +200,7 @@ On server 3:
 ./ticket -n 3 -a 10.0.0.3:11001 -j 10.0.0.1:11001
 ```
 
-Now you have a raft cluster running on three distinct servers in the same local network. This may be enough for applications that only require a [network security policy](https://en.wikipedia.org/wiki/Network_security). Basically any server on the local network can access the cluster.
+Now you have a Raft cluster running on three distinct servers in the same local network. This may be enough for applications that only require a [network security policy](https://en.wikipedia.org/wiki/Network_security). Basically any server on the local network can access the cluster.
 
 ### Auth password
 
