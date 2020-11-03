@@ -8,16 +8,16 @@
 
 <p align="center">High Availabilty Framework for Happy Data</p>
 
-Uhaha is a framework for building highly available data applications in Go. 
+Uhaha is a framework for building highly available Raft-based data applications in Go. 
 This is bascially an upgrade to my [Finn](https://github.com/tidwall/finn)
 project, which was good but Uhaha is gooder because Uhaha has more security
 features (TLS and auth passwords), customizable services, deterministic time,
 recalculable random numbers, simpler snapshots, a smaller network footprint,
-and other stuff too.  
+and other stuff too.
 
 ## Features
 
-- Simple API for quickly creating a high available fault-tolerant cluster.
+- Simple API for quickly creating a custom Raft-based application.
 - Deterministic monotonic time that does not drift and stays in sync with the internet.
 - APIs for building custom services such as HTTP and gRPC. 
   Supports the Redis protocol by default, so any Redis-compatible client
