@@ -2,7 +2,6 @@
 	<img src="logo.png" border=0 width=500 alt="uhaha">
 </p>
 <p align="center">
-<a href="https://travis-ci.org/tidwall/uhaha"><img src="https://img.shields.io/travis/tidwall/uhaha.svg?style=flat-square" alt="Build Status"></a>
 <a href="https://godoc.org/github.com/tidwall/uhaha"><img src="https://img.shields.io/badge/api-reference-blue.svg?style=flat-square" alt="GoDoc"></a>
 </p>
 
