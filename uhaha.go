@@ -971,6 +971,23 @@ func (e *serverEntry) clusterID() string {
 	return hex.EncodeToString(src[:])
 }
 
+func (e *serverEntry) host() string {
+	idx := strings.LastIndexByte(e.address, ':')
+	if idx == -1 {
+		return ""
+	}
+	return e.address[:idx]
+}
+
+func (e *serverEntry) port() int {
+	idx := strings.LastIndexByte(e.address, ':')
+	if idx == -1 {
+		return 0
+	}
+	port, _ := strconv.Atoi(e.address[idx+1:])
+	return port
+}
+
 func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 	leader := string(ra.Leader())
 	f := ra.GetConfiguration()
@@ -1071,7 +1088,7 @@ func errRaftConvert(ra *raftWrap, err error) error {
 		if leader != "" {
 			return fmt.Errorf("MOVED 0 %s", leader)
 		}
-		fallthrough
+		return fmt.Errorf("TRYAGAIN %s", err)
 	case raft.ErrRaftShutdown, raft.ErrTransportShutdown:
 		return fmt.Errorf("CLUSTERDOWN %s", err)
 	}
@@ -2332,36 +2349,16 @@ func readSnapInfo(id, path string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// apath, err := filepath.Abs(path)
-	// if err != nil {
-	// 	return nil, err
-	// }
 	status["timestamp"] = fmt.Sprint(ts)
 	status["id"] = id
 	status["size"] = fmt.Sprint(fi.Size())
-	// status["file"] = apath
 	return status, nil
 }
 
 var clusterCommands = map[string]command{
-	"help":  command{'s', cmdCLUSTERHELP},
 	"info":  command{'s', cmdCLUSTERINFO},
 	"slots": command{'s', cmdCLUSTERSLOTS},
-}
-
-// CLUSTER HELP
-// help: returns the valid CLUSTER related commands; []string
-func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
-	if len(args) != 2 {
-		return nil, errWrongNumArgsRaft
-	}
-	lines := []redcon.SimpleString{
-		"CLUSTER <subcommand> arg arg ... arg. Subcommands are:",
-		"INFO",
-		"SLOTS",
-	}
-	return lines, nil
+	"nodes": command{'s', cmdCLUSTERNODES},
 }
 
 // CLUSTER INFO
@@ -2409,22 +2406,53 @@ func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
 	if !leader.leader {
 		return nil, errors.New("CLUSTERDOWN The cluster is down")
 	}
-	var port int
-	idx := strings.LastIndexByte(leader.address, ':')
-	if idx != -1 {
-		port, _ = strconv.Atoi(leader.address[idx+1:])
-	}
 	return []interface{}{
 		[]interface{}{
 			redcon.SimpleInt(0),
 			redcon.SimpleInt(16383),
 			[]interface{}{
-				leader.address[:idx],
-				redcon.SimpleInt(port),
+				leader.host(),
+				redcon.SimpleInt(leader.port()),
 				leader.clusterID(),
 			},
 		},
 	}, nil
+}
+
+// CLUSTER NODES
+// help: returns the cluster nodes
+func cmdCLUSTERNODES(um Machine, ra *raftWrap, args []string,
+) (interface{}, error) {
+	slist, err := ra.getServerList()
+	if err != nil {
+		return nil, errRaftConvert(ra, err)
+	}
+	var leader serverEntry
+	for _, server := range slist {
+		if server.leader {
+			leader = server
+			break
+		}
+	}
+	if !leader.leader {
+		return nil, errors.New("CLUSTERDOWN The cluster is down")
+	}
+	leaderID := leader.clusterID()
+	var result string
+	for _, server := range slist {
+		flags := "slave"
+		followerOf := leaderID
+		if server.leader {
+			flags = "master"
+			followerOf = "-"
+		}
+		result += fmt.Sprintf("%s %s:%d@%d %s %s 0 0 connected 0-16383\n",
+			server.clusterID(),
+			server.host(), server.port(), server.port(),
+			flags, followerOf,
+		)
+	}
+	return result, nil
 }
 
 var raftCommands = map[string]command{
