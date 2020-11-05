@@ -17,10 +17,9 @@ and other stuff too.
 ## Features
 
 - Simple API for quickly creating a custom Raft-based application.
-- Deterministic monotonic time that does not drift and stays in sync with the Internet.
-- APIs for building custom services such as HTTP and gRPC. 
-  Supports the Redis protocol by default, so any Redis-compatible client
-  library will work with Uhaha.
+- Deterministic monotonic time that does not drift and stays in sync with the internet.
+- APIs for building custom services such as HTTP and gRPC.
+  Supports the Redis protocol by default, so most Redis client library will work with Uhaha.
 - [TLS](#tls) and [Auth password](#auth-password) support.
 - Multiple examples to help jumpstart integration, including
   a [Key-value DB](https://github.com/tidwall/uhaha/tree/master/examples/kvdb), 
@@ -258,9 +257,6 @@ Finally you can connect to the server from a client that has the `rootCA.pem`.
 redis-cli -h 10.0.0.1 -p 11001 --tls --cacert rootCA.pem -a my-secret
 ```
 
-Yay 🎉. Super secure!
-
-
 ## Command-line options
 
 Below are all of the command line options.
@@ -269,38 +265,37 @@ Below are all of the command line options.
 Usage: my-uhaha-app [-n id] [-a addr] [options]
 
 Basic options:
-  -v              : display version
-  -h              : display help, this screen
-  -a addr         : bind to address  (default: 127.0.0.1:11001)
-  -n id           : node ID  (default: 1)
-  -d dir          : data directory  (default: data)
-  -j addr         : leader address of a cluster to join
-  -l level        : log level  (default: notice) [debug,verb,notice,warn,silent]
+  -v               : display version
+  -h               : display help, this screen
+  -a addr          : bind to address  (default: 127.0.0.1:11001)
+  -n id            : node ID  (default: 1)
+  -d dir           : data directory  (default: data)
+  -j addr          : leader address of a cluster to join
+  -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
-  --tls-cert path : path to TLS certificate
-  --tls-key path  : path to TLS private key
-  --auth auth     : cluster authorization, shared by all servers and clients
+  --tls-cert path  : path to TLS certificate
+  --tls-key path   : path to TLS private key
+  --auth auth      : cluster authorization, shared by all servers and clients
+
+Networking options:
+  --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
-  --nosync        : turn off syncing data to disk after every write. This leads
-                    to faster write operations but opens up the chance for data
-                    loss due to catastrophic events such as power failure.
-  --openreads     : allow followers to process read commands, but with the 
-                    possibility of returning stale data.
-  --localtime     : have the raft machine time synchronized with the local
-                    server rather than the public internet. This will run the 
-                    risk of time shifts when the local server time is
-                    drastically changed during live operation. 
-  --restore path  : restore a raft machine from a snapshot file. This will
-                    start a brand new single-node cluster using the snapshot as
-                    initial data. The other nodes must be re-joined. This
-                    operation is ignored when a data directory already exists.
-                    Cannot be used with -j flag.
-  --preserve-addr : preserve original address from -a flag for all raft and
-                    client broadcasting. This is useful if you rely on domain
-                    ip address resolution at runtime or have a complexly
-                    orchestrated network.
+  --nosync         : turn off syncing data to disk after every write. This leads
+                     to faster write operations but opens up the chance for data
+                     loss due to catastrophic events such as power failure.
+  --openreads      : allow followers to process read commands, but with the
+                     possibility of returning stale data.
+  --localtime      : have the raft machine time synchronized with the local
+                     server rather than the public internet. This will run the
+                     risk of time shifts when the local server time is
+                     drastically changed during live operation.
+  --restore path   : restore a raft machine from a snapshot file. This will
+                     start a brand new single-node cluster using the snapshot as
+                     initial data. The other nodes must be re-joined. This
+                     operation is ignored when a data directory already exists.
+                     Cannot be used with -j flag.
 ```
 
 
