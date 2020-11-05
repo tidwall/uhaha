@@ -8,9 +8,11 @@ import (
 	"bufio"
 	"compress/gzip"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -201,6 +203,7 @@ type Config struct {
 	TLSKeyPath  string        // default ""
 	Auth        string        // default ""
 	Advertise   string        // default ""
+	TryErrors   bool          // default false (return TRY instead of MOVED)
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -296,6 +299,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.Auth, "auth", conf.Auth, "")
 	flag.StringVar(&conf.Advertise, "advertise", conf.Advertise, "")
 	flag.StringVar(&testNode, "t", "", "")
+	flag.BoolVar(&conf.TryErrors, "try-errors", conf.TryErrors, "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
 	}
@@ -336,6 +340,18 @@ func confInit(conf *Config) {
 		fmt.Fprintf(os.Stderr,
 			"flag --tls-cert cannot be empty when --tls-key is provided\n")
 		os.Exit(1)
+	}
+	if conf.Advertise != "" {
+		colon := strings.IndexByte(conf.Advertise, ':')
+		if colon == -1 {
+			fmt.Fprintf(os.Stderr, "flag --advertise is missing port number\n")
+			os.Exit(1)
+		}
+		_, err := strconv.ParseUint(conf.Advertise[colon+1:], 10, 16)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "flat --advertise port number invalid\n")
+			os.Exit(1)
+		}
 	}
 	if conf.Flag.PostParse != nil {
 		conf.Flag.PostParse()
@@ -649,8 +665,12 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 	m.commands = map[string]command{
 		"tick":    command{'w', cmdTICK},
 		"raft":    command{'s', cmdRAFT},
+		"cluster": command{'s', cmdCLUSTER},
 		"machine": command{'r', cmdMACHINE},
 		"version": command{'s', cmdVERSION},
+	}
+	if conf.TryErrors {
+		delete(m.commands, "cluster")
 	}
 	for k, v := range conf.cmds {
 		if _, ok := m.commands[k]; !ok {
@@ -747,6 +767,7 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	}
 	return &raftWrap{
 		Raft:      ra,
+		conf:      conf,
 		advertise: conf.Advertise,
 	}
 }
@@ -792,22 +813,33 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 			}
 		} else {
 			// Joining an existing cluster
-			log.Noticef("joining existing cluster at %v", conf.JoinAddr)
+			joinAddr := conf.JoinAddr
+			log.Noticef("joining existing cluster at %v", joinAddr)
 			err := func() error {
-				conn, err := redisDial(conf.JoinAddr, conf.Auth, tlscfg)
-				if err != nil {
-					return err
+				for {
+					conn, err := redisDial(joinAddr, conf.Auth, tlscfg)
+					if err != nil {
+						return err
+					}
+					defer conn.Close()
+					res, err := redis.String(conn.Do("raft", "server", "add",
+						conf.NodeID, addrStr))
+					if err != nil {
+						if strings.HasPrefix(err.Error(), "MOVED ") {
+							parts := strings.Split(err.Error(), " ")
+							if len(parts) == 3 {
+								joinAddr = parts[2]
+								time.Sleep(time.Millisecond * 100)
+								continue
+							}
+						}
+						return err
+					}
+					if res != "1" {
+						return fmt.Errorf("'1', got '%s'", res)
+					}
+					return nil
 				}
-				defer conn.Close()
-				res, err := redis.String(conn.Do("raft", "server", "add",
-					conf.NodeID, addrStr))
-				if err != nil {
-					return err
-				}
-				if res != "1" {
-					return fmt.Errorf("'1', got '%s'", res)
-				}
-				return nil
 			}()
 			if err != nil {
 				log.Fatalf("raft server add: %v", err)
@@ -900,12 +932,13 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 type serverExtra struct {
 	reachable  bool   // server is reachable
 	remoteAddr string // remote tcp address
-	broadcast  string // broadcast address
+	advertise  string // advertise address
 	lastError  error  // last error, if any
 }
 
 type raftWrap struct {
 	*raft.Raft
+	conf      Config
 	advertise string
 	mu        sync.RWMutex
 	extra     map[string]serverExtra
@@ -918,12 +951,49 @@ func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
 	for eaddr, extra := range ra.extra {
-		if eaddr == addr || extra.broadcast == addr ||
+		if eaddr == addr || extra.advertise == addr ||
 			extra.remoteAddr == addr {
 			return extra, true
 		}
 	}
 	return extra, false
+}
+
+type serverEntry struct {
+	id      string
+	address string
+	resolve string
+	leader  bool
+}
+
+func (e *serverEntry) clusterID() string {
+	src := sha1.Sum([]byte(e.id))
+	return hex.EncodeToString(src[:])
+}
+
+func (ra *raftWrap) getServerList() ([]serverEntry, error) {
+	leader := string(ra.Leader())
+	f := ra.GetConfiguration()
+	err := f.Error()
+	if err != nil {
+		return nil, err
+	}
+	cfg := f.Configuration()
+	var servers []serverEntry
+	for _, s := range cfg.Servers {
+		var entry serverEntry
+		entry.id = string(s.ID)
+		entry.address = string(s.Address)
+		extra, ok := ra.getExtraForAddr(entry.address)
+		if ok {
+			entry.resolve = extra.remoteAddr
+		} else {
+			entry.resolve = entry.address
+		}
+		entry.leader = entry.resolve == leader || entry.address == leader
+		servers = append(servers, entry)
+	}
+	return servers, nil
 }
 
 func runMaintainServers(ra *raftWrap) {
@@ -959,7 +1029,7 @@ func runMaintainServers(ra *raftWrap) {
 					extra.reachable = true
 					extra.lastError = nil
 					extra.remoteAddr = c.RemoteAddr().String()
-					extra.broadcast = addr
+					extra.advertise = addr
 				}
 				ra.extra[addr] = extra
 			}(string(svr.Address))
@@ -969,7 +1039,7 @@ func runMaintainServers(ra *raftWrap) {
 	}
 }
 
-func getLeaderBroadcastAddr(ra *raftWrap) string {
+func getLeaderAdvertiseAddr(ra *raftWrap) string {
 	leader := string(ra.Leader())
 	if ra.advertise == "" {
 		return leader
@@ -981,15 +1051,29 @@ func getLeaderBroadcastAddr(ra *raftWrap) string {
 	if !ok {
 		return ""
 	}
-	return extra.broadcast
+	return extra.advertise
 }
 
 func errRaftConvert(ra *raftWrap, err error) error {
-	if err == raft.ErrNotLeader {
-		leader := getLeaderBroadcastAddr(ra)
-		if leader != "" {
-			return fmt.Errorf("TRY %s", leader)
+	if ra.conf.TryErrors {
+		if err == raft.ErrNotLeader {
+			leader := getLeaderAdvertiseAddr(ra)
+			if leader != "" {
+				return fmt.Errorf("TRY %s", leader)
+			}
 		}
+		return err
+	}
+	switch err {
+	case raft.ErrNotLeader, raft.ErrLeadershipLost,
+		raft.ErrLeadershipTransferInProgress:
+		leader := getLeaderAdvertiseAddr(ra)
+		if leader != "" {
+			return fmt.Errorf("MOVED 0 %s", leader)
+		}
+		fallthrough
+	case raft.ErrRaftShutdown, raft.ErrTransportShutdown:
+		return fmt.Errorf("CLUSTERDOWN %s", err)
 	}
 	return err
 }
@@ -1072,7 +1156,7 @@ func getClusterLastIndex(ra *raftWrap, tlscfg *tls.Config, auth string,
 	if ra.State() == raft.Leader {
 		return ra.LastIndex(), nil
 	}
-	addr := getLeaderBroadcastAddr(ra)
+	addr := getLeaderAdvertiseAddr(ra)
 	if addr == "" {
 		return 0, errLeaderUnknown
 	}
@@ -1561,6 +1645,16 @@ func errUnknownRaftCommand(args []string) error {
 		strings.TrimSpace(cmd))
 }
 
+func errUnknownClusterCommand(args []string) error {
+	var cmd string
+	for _, arg := range args {
+		cmd += arg + " "
+	}
+	return fmt.Errorf("unknown subcommand or wrong number of arguments for "+
+		"'%s', try CLUSTER HELP",
+		strings.TrimSpace(cmd))
+}
+
 // ErrSyntax is returned where there was a syntax error
 var ErrSyntax = errors.New("syntax error")
 
@@ -1899,6 +1993,24 @@ func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	return nil, nil
 }
 
+// CLUSTER subcommand args...
+// help: calls a system-level cluster operation.
+func cmdCLUSTER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+	m := getBaseMachine(um)
+	if m == nil {
+		return nil, ErrInvalid
+	}
+	if len(args) < 2 {
+		return nil, errWrongNumArgsRaft
+	}
+	args[1] = strings.ToLower(args[1])
+	rcmd, ok := clusterCommands[args[1]]
+	if !ok {
+		return nil, errUnknownClusterCommand(args[:2])
+	}
+	return rcmd.fn(m, ra, args)
+}
+
 // RAFT subcommand args...
 // help: calls a system-level raft operation.
 func cmdRAFT(um Machine, ra *raftWrap, args []string) (interface{}, error) {
@@ -1924,7 +2036,7 @@ func cmdRAFTLEADER(um Machine, ra *raftWrap, args []string,
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
-	return getLeaderBroadcastAddr(ra), nil
+	return getLeaderAdvertiseAddr(ra), nil
 }
 
 // RAFT SERVER subcommand args...
@@ -1957,25 +2069,19 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
 	}
-	f := ra.GetConfiguration()
-	err := f.Error()
+	servers, err := ra.getServerList()
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
 	}
-	cfg := f.Configuration()
-	var servers [][]string
-	for i := 0; i < len(cfg.Servers); i++ {
-		data := []string{"id", string(cfg.Servers[i].ID)}
-		extra, ok := ra.getExtraForAddr(string(cfg.Servers[i].Address))
-		data = append(data, "address", string(cfg.Servers[i].Address))
-		if ok {
-			data = append(data, "resolve", extra.remoteAddr)
-		} else {
-			data = append(data, "resolve", string(cfg.Servers[i].Address))
-		}
-		servers = append(servers, data)
+	var res [][]string
+	for _, s := range servers {
+		res = append(res, []string{
+			"id", s.id,
+			"address", s.resolve,
+			"leader", fmt.Sprint(s.leader),
+		})
 	}
-	return servers, nil
+	return res, nil
 }
 
 // RAFT SERVER REMOVE id
@@ -2237,6 +2343,90 @@ func readSnapInfo(id, path string) (map[string]string, error) {
 	return status, nil
 }
 
+var clusterCommands = map[string]command{
+	"help":  command{'s', cmdCLUSTERHELP},
+	"info":  command{'s', cmdCLUSTERINFO},
+	"slots": command{'s', cmdCLUSTERSLOTS},
+}
+
+// CLUSTER HELP
+// help: returns the valid CLUSTER related commands; []string
+func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string,
+) (interface{}, error) {
+	if len(args) != 2 {
+		return nil, errWrongNumArgsRaft
+	}
+	lines := []redcon.SimpleString{
+		"CLUSTER <subcommand> arg arg ... arg. Subcommands are:",
+		"INFO",
+		"SLOTS",
+	}
+	return lines, nil
+}
+
+// CLUSTER INFO
+// help: returns various redis cluster info; string
+func cmdCLUSTERINFO(um Machine, ra *raftWrap, args []string,
+) (interface{}, error) {
+	slist, err := ra.getServerList()
+	if err != nil {
+		return nil, errRaftConvert(ra, err)
+	}
+	size := len(slist)
+	epoch := ra.LastIndex()
+	return fmt.Sprintf(""+
+		"cluster_state:ok\n"+
+		"cluster_slots_assigned:16384\n"+
+		"cluster_slots_ok:16384\n"+
+		"cluster_slots_pfail:0\n"+
+		"cluster_slots_fail:0\n"+
+		"cluster_known_nodes:%d\n"+
+		"cluster_size:%d\n"+
+		"cluster_current_epoch:%d\n"+
+		"cluster_my_epoch:%d\n"+
+		"cluster_stats_messages_sent:0\n"+
+		"cluster_stats_messages_received:0\n",
+		size, size, epoch, epoch,
+	), nil
+}
+
+// CLUSTER SLOTS
+// help: returns the cluster slots, which is always all slots being assigned
+// to the leader.
+func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
+) (interface{}, error) {
+	slist, err := ra.getServerList()
+	if err != nil {
+		return nil, errRaftConvert(ra, err)
+	}
+	var leader serverEntry
+	for _, server := range slist {
+		if server.leader {
+			leader = server
+			break
+		}
+	}
+	if !leader.leader {
+		return nil, errors.New("CLUSTERDOWN The cluster is down")
+	}
+	var port int
+	idx := strings.LastIndexByte(leader.resolve, ':')
+	if idx != -1 {
+		port, _ = strconv.Atoi(leader.resolve[idx+1:])
+	}
+	return []interface{}{
+		[]interface{}{
+			redcon.SimpleInt(0),
+			redcon.SimpleInt(16383),
+			[]interface{}{
+				leader.resolve[:idx],
+				redcon.SimpleInt(port),
+				leader.clusterID(),
+			},
+		},
+	}, nil
+}
+
 var raftCommands = map[string]command{
 	"help":     command{'s', cmdRAFTHELP},
 	"info":     command{'s', cmdRAFTINFO},
@@ -2252,18 +2442,20 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
-	lines := []string{
-		"RAFT LEADER",
-		"RAFT INFO [pattern]",
+	lines := []redcon.SimpleString{
+		"RAFT <subcommand> arg arg ... arg. Subcommands are:",
 
-		"RAFT SERVER LIST",
-		"RAFT SERVER ADD id address",
-		"RAFT SERVER REMOVE id",
+		"LEADER",
+		"INFO [pattern]",
 
-		"RAFT SNAPSHOT NOW",
-		"RAFT SNAPSHOT LIST",
-		"RAFT SNAPSHOT FILE id",
-		"RAFT SNAPSHOT READ id [RANGE start end]",
+		"SERVER LIST",
+		"SERVER ADD id address",
+		"SERVER REMOVE id",
+
+		"SNAPSHOT NOW",
+		"SNAPSHOT LIST",
+		"SNAPSHOT FILE id",
+		"SNAPSHOT READ id [RANGE start end]",
 	}
 	return lines, nil
 }
@@ -2438,7 +2630,7 @@ func (m *monitor) Send(msg Message) {
 	if len(msg.Args) > 0 {
 		// do not allow monitoring of certain system commands
 		switch msg.Args[0] {
-		case "raft", "machine", "auth":
+		case "raft", "machine", "auth", "cluster":
 			return
 		}
 	}

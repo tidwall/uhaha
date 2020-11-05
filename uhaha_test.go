@@ -100,8 +100,7 @@ func TestClusters(t *testing.T) {
 }
 
 func isNotLeaderErr(err error) bool {
-	return err != nil && (err.Error() == "ERR node is not the leader" ||
-		strings.HasPrefix(err.Error(), "TRY "))
+	return err != nil && strings.HasPrefix(err.Error(), "MOVED ")
 }
 
 type instance struct {
