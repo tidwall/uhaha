@@ -2077,7 +2077,7 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 	for _, s := range servers {
 		res = append(res, []string{
 			"id", s.id,
-			"address", s.resolve,
+			"address", s.address,
 			"leader", fmt.Sprint(s.leader),
 		})
 	}
@@ -2410,16 +2410,16 @@ func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
 		return nil, errors.New("CLUSTERDOWN The cluster is down")
 	}
 	var port int
-	idx := strings.LastIndexByte(leader.resolve, ':')
+	idx := strings.LastIndexByte(leader.address, ':')
 	if idx != -1 {
-		port, _ = strconv.Atoi(leader.resolve[idx+1:])
+		port, _ = strconv.Atoi(leader.address[idx+1:])
 	}
 	return []interface{}{
 		[]interface{}{
 			redcon.SimpleInt(0),
 			redcon.SimpleInt(16383),
 			[]interface{}{
-				leader.resolve[:idx],
+				leader.address[:idx],
 				redcon.SimpleInt(port),
 				leader.clusterID(),
 			},
