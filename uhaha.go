@@ -1088,7 +1088,7 @@ func errRaftConvert(ra *raftWrap, err error) error {
 		if leader != "" {
 			return fmt.Errorf("MOVED 0 %s", leader)
 		}
-		return fmt.Errorf("TRYAGAIN %s", err)
+		fallthrough
 	case raft.ErrRaftShutdown, raft.ErrTransportShutdown:
 		return fmt.Errorf("CLUSTERDOWN %s", err)
 	}
