@@ -175,6 +175,12 @@ type Config struct {
 	// been initialized. The logger is can be safely used concurrently.
 	LogReady func(log Logger)
 
+	// ServerReady is an optional callback function that fires when the server
+	// socket is listening and is ready to accept incoming connections. The
+	// network address, auth, and tls-config are provided to allow for
+	// background connections to be made to self, if desired.
+	ServerReady func(addr, auth string, tlscfg *tls.Config)
+
 	// ConnOpened is an optional callback function that fires when a new
 	// network connection was opened on this machine. You can accept or deny
 	// the connection, and optionally provide a client-specific context that
@@ -817,7 +823,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 			log.Noticef("joining existing cluster at %v", joinAddr)
 			err := func() error {
 				for {
-					conn, err := redisDial(joinAddr, conf.Auth, tlscfg)
+					conn, err := RedisDial(joinAddr, conf.Auth, tlscfg)
 					if err != nil {
 						return err
 					}
@@ -875,10 +881,10 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 	}
 }
 
-// redisDial simply dials out to another Uhaha server with redis protocol and
-// using the provded TLS config and Auth token. The TLS/Auth must be correct
-// in order to establish a connection.
-func redisDial(addr, auth string, tlscfg *tls.Config) (redis.Conn, error) {
+// RedisDial is a helper function that dials out to another Uhaha server with
+// redis protocol and using the provded TLS config and Auth token. The TLS/Auth
+// must be correct in order to establish a connection.
+func RedisDial(addr, auth string, tlscfg *tls.Config) (redis.Conn, error) {
 	var conn redis.Conn
 	var err error
 	if tlscfg != nil {
@@ -1177,7 +1183,7 @@ func getClusterLastIndex(ra *raftWrap, tlscfg *tls.Config, auth string,
 	if addr == "" {
 		return 0, errLeaderUnknown
 	}
-	conn, err := redisDial(addr, auth, tlscfg)
+	conn, err := RedisDial(addr, auth, tlscfg)
 	if err != nil {
 		return 0, err
 	}
@@ -1386,6 +1392,9 @@ func serverInit(conf Config, tlscfg *tls.Config, log *redlog.Logger,
 	if conf.Advertise != "" {
 		log.Printf("server advertising as %s", conf.Advertise)
 	}
+	if conf.ServerReady != nil {
+		conf.ServerReady(ln.Addr().String(), conf.Auth, tlscfg)
+	}
 	return newSplitServer(ln, log), ln.Addr()
 }
 
@@ -1421,6 +1430,9 @@ func tlsInit(conf Config, log *redlog.Logger) *tls.Config {
 	return tlscfg
 }
 
+// splitServer split a sinle server socket/listener into multiple logical
+// listeners. For our use case, there is one transport listener and one client
+// listener sharing the same server socket.
 type splitServer struct {
 	ln       net.Listener
 	log      *redlog.Logger
