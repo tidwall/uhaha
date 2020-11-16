@@ -35,7 +35,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/tidwall/match"
 	"github.com/tidwall/redcon"
-	"github.com/tidwall/redlog"
+	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
 
 	raftboltdb "github.com/hashicorp/raft-boltdb"
