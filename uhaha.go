@@ -1664,6 +1664,8 @@ func (s *fsmSnap) Release() {
 }
 
 var errWrongNumArgsRaft = errors.New("wrong number of arguments, try RAFT HELP")
+var errWrongNumArgsCluster = errors.New("wrong number of arguments, " +
+	"try CLUSTER HELP")
 
 func errUnknownRaftCommand(args []string) error {
 	var cmd string
@@ -2030,7 +2032,7 @@ func cmdCLUSTER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 		return nil, ErrInvalid
 	}
 	if len(args) < 2 {
-		return nil, errWrongNumArgsRaft
+		return nil, errWrongNumArgsCluster
 	}
 	args[1] = strings.ToLower(args[1])
 	rcmd, ok := clusterCommands[args[1]]
@@ -2368,9 +2370,25 @@ func readSnapInfo(id, path string) (map[string]string, error) {
 }
 
 var clusterCommands = map[string]command{
+	"help":  command{'s', cmdCLUSTERHELP},
 	"info":  command{'s', cmdCLUSTERINFO},
 	"slots": command{'s', cmdCLUSTERSLOTS},
 	"nodes": command{'s', cmdCLUSTERNODES},
+}
+
+// CLUSTER HELP
+// help: returns the valid RAFT related commands; []string
+func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string,
+) (interface{}, error) {
+	if len(args) != 2 {
+		return nil, errWrongNumArgsRaft
+	}
+	lines := []redcon.SimpleString{
+		"CLUSTER INFO",
+		"CLUSTER NODES",
+		"CLUSTER SLOTS",
+	}
+	return lines, nil
 }
 
 // CLUSTER INFO
@@ -2483,19 +2501,17 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 		return nil, errWrongNumArgsRaft
 	}
 	lines := []redcon.SimpleString{
-		"RAFT <subcommand> arg arg ... arg. Subcommands are:",
+		"RAFT LEADER",
+		"RAFT INFO [pattern]",
 
-		"LEADER",
-		"INFO [pattern]",
+		"RAFT SERVER LIST",
+		"RAFT SERVER ADD id address",
+		"RAFT SERVER REMOVE id",
 
-		"SERVER LIST",
-		"SERVER ADD id address",
-		"SERVER REMOVE id",
-
-		"SNAPSHOT NOW",
-		"SNAPSHOT LIST",
-		"SNAPSHOT FILE id",
-		"SNAPSHOT READ id [RANGE start end]",
+		"RAFT SNAPSHOT NOW",
+		"RAFT SNAPSHOT LIST",
+		"RAFT SNAPSHOT FILE id",
+		"RAFT SNAPSHOT READ id [RANGE start end]",
 	}
 	return lines, nil
 }
