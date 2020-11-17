@@ -2161,15 +2161,21 @@ func cmdRAFTINFO(um Machine, ra *raftWrap, args []string,
 	default:
 		return nil, errWrongNumArgsRaft
 	}
-	status := ra.Stats()
+	if pattern == "state" {
+		// Fast path to avoid locks. Under the hood there's only a single
+		// atomic load
+		return []string{"state", ra.State().String()}, nil
+	}
+
+	stats := ra.Stats()
 	m.mu.RLock()
 	behind := m.logRemain
 	percent := m.logPercent
 	m.mu.RUnlock()
-	status["logs_behind"] = fmt.Sprint(behind)
-	status["logs_loaded_percent"] = fmt.Sprintf("%0.1f", percent*100)
+	stats["logs_behind"] = fmt.Sprint(behind)
+	stats["logs_loaded_percent"] = fmt.Sprintf("%0.1f", percent*100)
 	final := make(map[string]string)
-	for key, value := range status {
+	for key, value := range stats {
 		if match.Match(key, pattern) {
 			final[key] = value
 		}
