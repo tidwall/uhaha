@@ -15,6 +15,6 @@ require (
 	github.com/tidwall/redlog/v2 v2.0.3
 	github.com/tidwall/rhh v1.1.1
 	github.com/tidwall/rtime v0.1.2
-	github.com/tidwall/sds v0.1.0 // indirect
-	github.com/tidwall/tinybtree v1.0.1 // indirect
+	github.com/tidwall/sds v0.1.0
+	github.com/tidwall/tinybtree v1.0.1
 )
