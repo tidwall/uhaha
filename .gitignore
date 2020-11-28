@@ -1,3 +1,4 @@
 /data*
 testing/
 *.pem
+cluster-check/
