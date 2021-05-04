@@ -954,6 +954,9 @@ func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
 	if ra.advertise == "" {
 		return extra, false
 	}
+	if strings.HasPrefix(addr, "[::]") {
+		addr = "127.0.0.1" + addr[4:]
+	}
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
 	for eaddr, extra := range ra.extra {
