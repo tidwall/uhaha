@@ -108,6 +108,7 @@ Advanced options:
                      initial data. The other nodes must be re-joined. This
                      operation is ignored when a data directory already exists.
                      Cannot be used with -j flag.
+  --init-run-quit  : initialize a bootstrap operation and then quit.
 `
 
 // Config is the configuration for managing the behavior of the application.
@@ -210,6 +211,7 @@ type Config struct {
 	Auth        string        // default ""
 	Advertise   string        // default ""
 	TryErrors   bool          // default false (return TRY instead of MOVED)
+	InitRunQuit bool          // default false
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -306,6 +308,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.Advertise, "advertise", conf.Advertise, "")
 	flag.StringVar(&testNode, "t", "", "")
 	flag.BoolVar(&conf.TryErrors, "try-errors", conf.TryErrors, "")
+	flag.BoolVar(&conf.InitRunQuit, "init-run-quit", conf.InitRunQuit, "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
 	}
@@ -932,6 +935,10 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 			return 0, s.sniff(rd)
 		})
 		go s.serve(newService(m, ra, conf.Auth), ln)
+	}
+	if conf.InitRunQuit {
+		log.Notice("init run quit")
+		os.Exit(0)
 	}
 }
 
@@ -3026,6 +3033,9 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 					} else {
 						r = Response(nil, 0, ErrWrongNumArgs)
 					}
+				case "shutdown":
+					s.Log().Error("Shutting down")
+					os.Exit(0)
 				case "echo":
 					if len(args) != 2 {
 						r = Response(nil, 0, ErrWrongNumArgs)
