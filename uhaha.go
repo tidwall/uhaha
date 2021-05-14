@@ -673,6 +673,7 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 	m.tick = conf.Tick
 	m.commands = map[string]command{
 		"tick":    {'w', cmdTICK},
+		"barrier": {'w', cmdBARRIER},
 		"raft":    {'s', cmdRAFT},
 		"cluster": {'s', cmdCLUSTER},
 		"machine": {'r', cmdMACHINE},
@@ -1992,6 +1993,17 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 		m.ts = info.TS
 		m.seed = info.Seed
 	}
+}
+
+// BARRIER
+// help: barrier is a noop that saves to the raft log. It can be used to
+//       ensure that the current server is the leader and that the cluster
+//       is working.
+func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+	if len(args) != 1 {
+		return nil, ErrWrongNumArgs
+	}
+	return redcon.SimpleString("OK"), nil
 }
 
 // TICK timestamp-int64 random-int64
