@@ -672,11 +672,11 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 	m.jsonType = conf.jsonType
 	m.tick = conf.Tick
 	m.commands = map[string]command{
-		"tick":    command{'w', cmdTICK},
-		"raft":    command{'s', cmdRAFT},
-		"cluster": command{'s', cmdCLUSTER},
-		"machine": command{'r', cmdMACHINE},
-		"version": command{'s', cmdVERSION},
+		"tick":    {'w', cmdTICK},
+		"raft":    {'s', cmdRAFT},
+		"cluster": {'s', cmdCLUSTER},
+		"machine": {'r', cmdMACHINE},
+		"version": {'s', cmdVERSION},
 	}
 	if conf.TryErrors {
 		delete(m.commands, "cluster")
@@ -811,7 +811,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 
 			var configuration raft.Configuration
 			configuration.Servers = []raft.Server{
-				raft.Server{
+				{
 					ID:      raft.ServerID(conf.NodeID),
 					Address: raft.ServerAddress(addrStr),
 				},
@@ -2386,10 +2386,10 @@ func readSnapInfo(id, path string) (map[string]string, error) {
 }
 
 var clusterCommands = map[string]command{
-	"help":  command{'s', cmdCLUSTERHELP},
-	"info":  command{'s', cmdCLUSTERINFO},
-	"slots": command{'s', cmdCLUSTERSLOTS},
-	"nodes": command{'s', cmdCLUSTERNODES},
+	"help":  {'s', cmdCLUSTERHELP},
+	"info":  {'s', cmdCLUSTERINFO},
+	"slots": {'s', cmdCLUSTERSLOTS},
+	"nodes": {'s', cmdCLUSTERNODES},
 }
 
 // CLUSTER HELP
@@ -2502,11 +2502,11 @@ func cmdCLUSTERNODES(um Machine, ra *raftWrap, args []string,
 }
 
 var raftCommands = map[string]command{
-	"help":     command{'s', cmdRAFTHELP},
-	"info":     command{'s', cmdRAFTINFO},
-	"leader":   command{'s', cmdRAFTLEADER},
-	"snapshot": command{'s', cmdRAFTSNAPSHOT},
-	"server":   command{'s', cmdRAFTSERVER},
+	"help":     {'s', cmdRAFTHELP},
+	"info":     {'s', cmdRAFTINFO},
+	"leader":   {'s', cmdRAFTLEADER},
+	"snapshot": {'s', cmdRAFTSNAPSHOT},
+	"server":   {'s', cmdRAFTSERVER},
 }
 
 // RAFT HELP

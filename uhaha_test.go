@@ -21,7 +21,6 @@ import (
 )
 
 const app = "6a8d5bef.app"
-const doTimeout = 30 * time.Second
 
 func wlog(format string, args ...interface{}) {
 	line := strings.TrimSpace(fmt.Sprintf(format, args...))
@@ -97,10 +96,6 @@ func TestClusters(t *testing.T) {
 			testCluster(size)
 		})
 	}
-}
-
-func isNotLeaderErr(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "MOVED ")
 }
 
 type instance struct {
@@ -245,35 +240,6 @@ func runClients(size int, wg *sync.WaitGroup, mu *sync.Mutex, ded *bool) {
 	mu.Lock()
 	*ded = true
 	mu.Unlock()
-}
-
-func runChaos(
-	size int, insts []*instance, wg, cwg *sync.WaitGroup,
-	mu *sync.Mutex, ded *bool,
-) {
-	defer cwg.Done()
-	if size == 1 {
-		return
-	}
-	// chaos is pretty much taking servers down and bringing them back up.
-	for {
-		mu.Lock()
-		if *ded {
-			mu.Unlock()
-			break
-		}
-		mu.Unlock()
-
-		i := rand.Int() % size
-		num := i + 1
-		wlog("::INST::%d/%d::TAKEDOWN", num, size)
-		insts[i].cmd.Process.Kill()
-		insts[i].wg.Wait()
-		wg.Add(1)
-		wlog("::INST::%d/%d::BRINGUP", num, size)
-		insts[i] = startInstance(num, size, wg)
-
-	}
 }
 
 type tconn struct {
