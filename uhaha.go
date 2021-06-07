@@ -962,9 +962,6 @@ func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
 	if ra.advertise == "" {
 		return extra, false
 	}
-	if strings.HasPrefix(addr, "[::]") {
-		addr = "127.0.0.1" + addr[4:]
-	}
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
 	for eaddr, extra := range ra.extra {
@@ -1392,9 +1389,9 @@ func serverInit(conf Config, tlscfg *tls.Config, log *redlog.Logger,
 	var ln net.Listener
 	var err error
 	if tlscfg != nil {
-		ln, err = tls.Listen("tcp", conf.Addr, tlscfg)
+		ln, err = tls.Listen("tcp4", conf.Addr, tlscfg)
 	} else {
-		ln, err = net.Listen("tcp", conf.Addr)
+		ln, err = net.Listen("tcp4", conf.Addr)
 	}
 	if err != nil {
 		log.Fatal(err)

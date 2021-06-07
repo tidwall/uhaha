@@ -85,19 +85,6 @@ func genSeed() {
 	rand.Seed(seed)
 }
 
-func TestClusters(t *testing.T) {
-	genSeed()
-	must(nil, os.MkdirAll("testing", 0777))
-	verifyGoVersion()
-	buildTestApp()
-	sizes := []int{1, 3, 5}
-	for _, size := range sizes {
-		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
-			testCluster(size)
-		})
-	}
-}
-
 type instance struct {
 	wg   sync.WaitGroup
 	num  int
@@ -187,7 +174,13 @@ func randStr(n int) string {
 	return string(bytes)
 }
 
-func testCluster(size int) {
+type TestClusterContext interface {
+	Monitor(size int)
+	Start(size, numClients int)
+	ExecClient(size int, clientNum int, c *TestConn)
+}
+
+func testSingleCluster(size int, ctx TestClusterContext, numClients int) {
 	killAll()
 	wlog("::CLUSTER::BEGIN::Size=%d", size)
 	insts := make([]*instance, size)
@@ -206,49 +199,32 @@ func testCluster(size int) {
 	for i := 0; i < size; i++ {
 		insts[i] = startInstance(i+1, size, &wg)
 	}
-	var mu sync.Mutex
-	var ded bool
-	var cwg sync.WaitGroup
-	cwg.Add(1)
-	go runClients(size, &cwg, &mu, &ded)
-	// go runChaos(size, insts, &wg, &cwg, &mu, &ded)
-	cwg.Wait()
-}
-
-func runClients(size int, wg *sync.WaitGroup, mu *sync.Mutex, ded *bool) {
-	defer wg.Done()
-	const S = 10
-	T := time.Second * S
-	C := 50
-	wlog("::CLUSTER::Run %d clients for %d seconds", C, S)
-
-	var keys rhh.Map
-	var set, deleted int
+	ctx.Start(size, numClients)
 	var wg2 sync.WaitGroup
-	wg2.Add(C)
-	for i := 0; i < C; i++ {
-		go execClient(&wg2, size, T, &keys, &set, &deleted, mu)
+	wg2.Add(numClients)
+	for i := 0; i < numClients; i++ {
+		go func(i int) {
+			defer wg2.Done()
+			c := OpenTestConn(size)
+			defer func() {
+				if c.conn != nil {
+					c.conn.Close()
+				}
+			}()
+			ctx.ExecClient(size, i, c)
+		}(i)
 	}
-
-	for i := 0; i < S; i++ {
-		time.Sleep(time.Second)
-		mu.Lock()
-		wlog("::RUNNING::%d/%d::%d SET::%d DEL", i+1, S, set, deleted)
-		mu.Unlock()
-	}
+	ctx.Monitor(size)
 	wg2.Wait()
-	mu.Lock()
-	*ded = true
-	mu.Unlock()
 }
 
-type tconn struct {
+type TestConn struct {
 	conn redis.Conn
 	size int
 }
 
-func openConn(size int) *tconn {
-	c := &tconn{size: size}
+func OpenTestConn(size int) *TestConn {
+	c := &TestConn{size: size}
 	start := time.Now()
 	for {
 		addr := fmt.Sprintf(":3300%d", (rand.Int()%size)+1)
@@ -273,7 +249,7 @@ func openConn(size int) *tconn {
 	return c
 }
 
-func (c *tconn) do(cmd string, args ...interface{}) interface{} {
+func (c *TestConn) Do(cmd string, args ...interface{}) interface{} {
 	start := time.Now()
 	for {
 		reply, err := c.conn.Do(cmd, args...)
@@ -284,7 +260,7 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 			}
 			// if isNotLeaderErr(err) {
 			c.conn.Close()
-			nc := openConn(c.size)
+			nc := OpenTestConn(c.size)
 			c.conn = nc.conn
 			continue
 		}
@@ -292,49 +268,153 @@ func (c *tconn) do(cmd string, args ...interface{}) interface{} {
 	}
 }
 
-func execClient(
-	wg *sync.WaitGroup, size int, dur time.Duration,
-	keys *rhh.Map, set, deleted *int, mu *sync.Mutex,
+func testClusters(t *testing.T, sizes []int, numClients int,
+	newCtx func() TestClusterContext,
 ) {
+	genSeed()
+	must(nil, os.MkdirAll("testing", 0777))
+	verifyGoVersion()
+	buildTestApp()
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
+			testSingleCluster(size, newCtx(), numClients)
+		})
+	}
+}
 
-	defer wg.Done()
+// NOOP TEST
+
+type noopTestCluster struct {
+}
+
+func newNoopTestCluster() *noopTestCluster {
+	return &noopTestCluster{}
+}
+
+func (ctx *noopTestCluster) Start(size int, numClients int) {
+	wlog("::CLUSTER::Run %d clients (NOOP)", numClients)
+}
+
+func (ctx *noopTestCluster) Monitor(size int) {}
+
+func (ctx *noopTestCluster) ExecClient(size int, clientNum int, c *TestConn) {}
+
+func TestNoopCluster(t *testing.T) {
+	testClusters(t,
+		[]int{1, 3, 5}, // sizes
+		50,             // clients
+		func() TestClusterContext { return newNoopTestCluster() },
+	)
+
+}
+
+// BASIC TEST
+
+type basicTestCluster struct {
+	secsRunTime int
+	mu          sync.Mutex
+	set         int
+	deleted     int
+	keys        rhh.Map
+}
+
+func newBasicTestCluster() *basicTestCluster {
+	return &basicTestCluster{
+		secsRunTime: 10,
+	}
+}
+
+func (ctx *basicTestCluster) Start(size int, numClients int) {
+	wlog("::CLUSTER::Run %d clients for %d seconds",
+		numClients, ctx.secsRunTime)
+}
+
+func (ctx *basicTestCluster) Monitor(size int) {
+	for i := 0; i < ctx.secsRunTime; i++ {
+		time.Sleep(time.Second)
+		ctx.mu.Lock()
+		wlog("::RUNNING::%d/%d::%d SET::%d DEL", i+1,
+			ctx.secsRunTime, ctx.set, ctx.deleted)
+		ctx.mu.Unlock()
+	}
+}
+
+func (ctx *basicTestCluster) ExecClient(size int, clientNum int, c *TestConn) {
+	dur := time.Second * time.Duration(ctx.secsRunTime)
 	start := time.Now()
-	c := openConn(size)
-	defer func() {
-		if c.conn != nil {
-			c.conn.Close()
-		}
-	}()
 	for time.Since(start) < dur {
 		// Set a random key
 		{
 			key := randStr(32)
-			reply, err := redis.String(c.do("SET", key, key), nil)
+			reply, err := redis.String(c.Do("SET", key, key), nil)
 			if reply != "OK" {
 				fmt.Printf("%v\n", err)
 				// continue
 				wlog("::CLIENT::Invalid reply '%s'", reply)
 				badnews()
 			}
-			mu.Lock()
-			keys.Set(key, true)
-			(*set)++
-			mu.Unlock()
+			ctx.mu.Lock()
+			ctx.keys.Set(key, true)
+			ctx.set++
+			ctx.mu.Unlock()
 
 		}
 		// Del a random key
 		{
-			mu.Lock()
-			key, _, _ := keys.GetPos(rand.Uint64())
-			mu.Unlock()
-			reply, _ := redis.Int(c.do("DEL", key), nil)
+			ctx.mu.Lock()
+			key, _, _ := ctx.keys.GetPos(rand.Uint64())
+			ctx.mu.Unlock()
+			reply, _ := redis.Int(c.Do("DEL", key), nil)
 			if reply != 1 && reply != 0 {
 				wlog("::CLIENT::Invalid reply '%d'", reply)
 				badnews()
 			}
-			mu.Lock()
-			*deleted += int(reply)
-			mu.Unlock()
+			ctx.mu.Lock()
+			ctx.deleted += int(reply)
+			ctx.mu.Unlock()
 		}
 	}
+}
+
+func TestClusters(t *testing.T) {
+	testClusters(t,
+		[]int{1, 3, 5}, // sizes
+		50,             // clients
+		func() TestClusterContext { return newBasicTestCluster() },
+	)
+}
+
+// LEADER ADVERTISE TEST
+
+type leaderAdvertiseTestCluster struct {
+}
+
+func newLeaderAdvertiseTestCluster() *leaderAdvertiseTestCluster {
+	return &leaderAdvertiseTestCluster{}
+}
+
+func (ctx *leaderAdvertiseTestCluster) Start(size int, numClients int) {
+	wlog("::CLUSTER::Run %d clients (LeaderAdvertise)", numClients)
+}
+
+func (ctx *leaderAdvertiseTestCluster) Monitor(size int) {}
+
+func (ctx *leaderAdvertiseTestCluster) ExecClient(size int, clientNum int,
+	c *TestConn,
+) {
+	out := c.Do("RAFT", "LEADER")
+	got := fmt.Sprintf("%s", out)
+	expect := "0.0.0.0:3300"
+	if !strings.HasPrefix(got, expect) {
+		panic(fmt.Sprintf("mismatch: got '%s', expected prefix '%s*'", got,
+			expect))
+	}
+}
+
+func TestLeaderAdvertise(t *testing.T) {
+	testClusters(t,
+		[]int{1, 3, 5}, // sizes
+		50,             // clients
+		func() TestClusterContext { return newLeaderAdvertiseTestCluster() },
+	)
 }
