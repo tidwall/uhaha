@@ -11,7 +11,7 @@ Uhaha is a framework for building highly available Raft-based data applications 
 This is basically an upgrade to the [Finn](https://github.com/tidwall/finn)
 project, but has an updated API, better security features (TLS and auth passwords), 
 customizable services, deterministic time, recalculable random numbers, 
-simpler snapshots, a smaller network footprint, and other stuff too.
+simpler snapshots, a smaller network footprint, and more.
 
 ## Features
 
