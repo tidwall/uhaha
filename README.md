@@ -8,10 +8,9 @@
 <p align="center">High Availabilty Framework for Happy Data</p>
 
 Uhaha is a framework for building highly available Raft-based data applications in Go. 
-This is basically an upgrade to the [Finn](https://github.com/tidwall/finn)
-project, but has an updated API, better security features (TLS and auth passwords), 
-customizable services, deterministic time, recalculable random numbers, 
-simpler snapshots, a smaller network footprint, and more.
+This is basically an upgrade to the [Finn](https://github.com/tidwall/finn) project, but has an updated API, better security features (TLS and auth passwords), 
+customizable services, deterministic time, recalculable random numbers, simpler snapshots, a smaller network footprint, and more.
+Under the hood it utilizes [hashicorp/raft](https://github.com/hashicorp/raft), [tidwall/redcon](https://github.com/tidwall/redcon), and [syndtr/goleveldb](https://github.com/syndtr/goleveldb).
 
 ## Features
 
