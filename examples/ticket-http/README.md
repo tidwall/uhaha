@@ -42,7 +42,7 @@ Now we have a fault-tolerant three node cluster up and running.
 
 ### Using
 
-The same commands as ticket applies, however it's possible to use an HTTP client to send the command as well.
+The same commands as [ticket](https://github.com/tidwall/uhaha/tree/master/examples/ticket) applies, however it's possible to use an HTTP client to send the command as well.
 
 I'll use the curl in the example below.
 
