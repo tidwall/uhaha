@@ -929,6 +929,7 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 	}
 	conf.services = append(services, nilServices...)
 	for _, s := range conf.services {
+		s := s
 		ln := svr.split(func(rd io.Reader) (n int, ok bool) {
 			if s.sniff == nil {
 				return 0, true
