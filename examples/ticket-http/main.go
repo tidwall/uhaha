@@ -5,17 +5,13 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 
 	"github.com/tidwall/uhaha"
 )
-
-type service func(s uhaha.Service, ln net.Listener)
 
 type data struct {
 	Ticket int64
@@ -42,11 +38,9 @@ func main() {
 	// Add a command that will change the value of a Ticket.
 	conf.AddWriteCommand("ticket", cmdTICKET)
 
-	// Add a HTTP service that will call the write command created above.
-	mux := http.NewServeMux() // You can wire up handlers to the mux.
-	svc, teardown := httpService(mux)
-	defer teardown()
-	conf.AddService(sniffHTTP, svc)
+	// Add an HTTP service that will call the write command created above.
+	mux := http.NewServeMux()
+	conf.AddService(buildService(mux))
 
 	// Finally, hand off all processing to uhaha.
 	uhaha.Main(conf)
@@ -66,65 +60,26 @@ func cmdTICKET(m uhaha.Machine, args []string) (interface{}, error) {
 	return data.Ticket, nil
 }
 
-// sniffHTTP inspects the first line of the io.Reader
-// to determine if this is an HTTP call.
-func sniffHTTP(r io.Reader) bool {
-	s := bufio.NewScanner(r)
-	tokens := strings.SplitN(s.Text(), " ", 2)
-	if len(tokens) != 2 {
-		return false
+func buildService(mux *http.ServeMux) (func(io.Reader) bool, func(uhaha.Service, net.Listener)){
+	handleRequest := func(s uhaha.Service, req *http.Request) uhaha.Receiver {
+		return s.Send([]string{"ticket"}, nil)
 	}
+	handleResponse := func(value interface{}, err error, w http.ResponseWriter) {
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(fmt.Sprintf("Error occured: %s", err)))
+			return
+		}
 
-	switch strings.ToUpper(strings.TrimSpace(tokens[0])) {
-	case http.MethodGet:
-		return true
-	case http.MethodHead:
-		return true
-	case http.MethodPost:
-		return true
-	case http.MethodPut:
-		return true
-	case http.MethodPatch:
-		return true
-	case http.MethodDelete:
-		return true
-	case http.MethodConnect:
-		return true
-	case http.MethodOptions:
-		return true
-	case http.MethodTrace:
-		return true
-	}
-	return false
-}
+		v, ok := value.(int64)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(fmt.Sprintf("Unable to parse value as integer: %v", value)))
+			return
+		}
 
-// httpService sets up a new HTTP server using the provided mux
-// and uses the uhaha.Service to send commands.
-// The handler simply calls the ticket command and waits for the response.
-func httpService(mux *http.ServeMux) (service, func() error) {
-	srv := http.Server{
-		Handler: mux,
+		w.Write([]byte(fmt.Sprintf("%d\n", v)))
 	}
-	svc := func(s uhaha.Service, ln net.Listener) {
-		mux.HandleFunc("/ticket", func(w http.ResponseWriter, req *http.Request) {
-			ctx, accept := s.Opened(req.RemoteAddr)
-			if !accept {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			defer s.Closed(ctx, req.RemoteAddr)
-			r := s.Send([]string{"ticket"}, nil)
-			v, _, err := r.Recv()
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(err.Error()))
-				return
-			}
-			w.Write([]byte(fmt.Sprintf("%v\n", v)))
-		})
-		s.Log().Printf("HTTP server listening on %s", ln.Addr().String())
-		s.Log().Fatal(srv.Serve(ln))
-	}
-
-	return svc, srv.Close
+	mux.HandleFunc("/ticket", uhaha.HandleFunc(handleRequest, handleResponse))
+	return uhaha.HTTPService(mux)
 }

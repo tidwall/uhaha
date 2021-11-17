@@ -2,3 +2,4 @@
 testing/
 *.pem
 cluster-check/
+.idea/

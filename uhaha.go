@@ -929,14 +929,14 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 	}
 	conf.services = append(services, nilServices...)
 	for _, s := range conf.services {
-		s := s
+		svc := s
 		ln := svr.split(func(rd io.Reader) (n int, ok bool) {
-			if s.sniff == nil {
+			if svc.sniff == nil {
 				return 0, true
 			}
-			return 0, s.sniff(rd)
+			return 0, svc.sniff(rd)
 		})
-		go s.serve(newService(m, ra, conf.Auth), ln)
+		go svc.serve(newService(m, ra, conf.Auth), ln)
 	}
 	if conf.InitRunQuit {
 		log.Notice("init run quit")
