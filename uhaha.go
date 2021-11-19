@@ -947,7 +947,6 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 type serverExtra struct {
 	reachable  bool   // server is reachable
 	remoteAddr string // remote tcp address
-	leader     bool   // is the leader
 	advertise  string // advertise address
 	lastError  error  // last error, if any
 }
@@ -3164,6 +3163,7 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 }
 
 func redisServiceHandler(s Service, ln net.Listener) {
+
 	s.Log().Fatal(redcon.Serve(ln,
 		// handle commands
 		func(conn redcon.Conn, cmd redcon.Command) {
