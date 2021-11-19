@@ -2835,7 +2835,6 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	case 'w': // write
 		leaderAddr := s.ra.Leader()
 		if  s.ra.State() != raft.Leader {
-			// Leader is maybe remote or down, let's try to call it
 			s.Log().Debug("Forwarding command to active leader")
 			r := &remoteWriteRequestFuture{
 				s: s,
