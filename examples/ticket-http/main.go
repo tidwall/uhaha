@@ -5,10 +5,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/tidwall/uhaha"
 )
@@ -60,26 +62,45 @@ func cmdTICKET(m uhaha.Machine, args []string) (interface{}, error) {
 	return data.Ticket, nil
 }
 
+func sniff(r io.Reader) bool {
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		line := s.Text()
+		if line == "" {
+			continue
+		}
+
+		return strings.Contains(line, "HTTP/1.")
+	}
+
+	return false
+}
+
 func buildService(mux *http.ServeMux) (func(io.Reader) bool, func(uhaha.Service, net.Listener)){
-	handleRequest := func(s uhaha.Service, req *http.Request) uhaha.Receiver {
-		return s.Send([]string{"ticket"}, nil)
-	}
-	handleResponse := func(value interface{}, err error, w http.ResponseWriter) {
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(fmt.Sprintf("Error occured: %s", err)))
-			return
-		}
+	return sniff, func(s uhaha.Service, ln net.Listener) {
+		mux.HandleFunc("/ticket", func(w http.ResponseWriter, r *http.Request) {
+			recv := s.Send([]string{"ticket"}, nil)
+			value, dur, err := recv.Recv()
+			s.Log().Printf("Request took %s", dur)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(fmt.Sprintf("Error occured: %s\n", err)))
+				return
+			}
 
-		v, ok := value.(int64)
-		if !ok {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(fmt.Sprintf("Unable to parse value as integer: %v", value)))
-			return
-		}
-
-		w.Write([]byte(fmt.Sprintf("%d\n", v)))
+			switch v := value.(type) {
+			case []byte:
+				w.Write(v)
+				break
+			case int64:
+				w.Write([]byte(fmt.Sprintf("%d\n", v)))
+				break
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(fmt.Sprintf("Unable to parse value: %v\n", value)))
+				return
+			}
+		})
+		s.Log().Fatal(http.Serve(ln, mux))
 	}
-	mux.HandleFunc("/ticket", uhaha.HandleFunc(handleRequest, handleResponse))
-	return uhaha.HTTPService(mux)
 }

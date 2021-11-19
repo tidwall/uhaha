@@ -409,7 +409,7 @@ func (conf *Config) AddCatchallCommand(
 	}}
 }
 
-// AddIntermediateCommand adds a command that is for peforming client and system
+// AddIntermediateCommand adds a command that is for performing client and system
 // specific operations. It *is not* intended for working with the machine data,
 // and doing so will risk data corruption.
 func (conf *Config) AddIntermediateCommand(name string,
@@ -947,6 +947,7 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 type serverExtra struct {
 	reachable  bool   // server is reachable
 	remoteAddr string // remote tcp address
+	leader     bool   // is the leader
 	advertise  string // advertise address
 	lastError  error  // last error, if any
 }
@@ -2690,7 +2691,7 @@ type Message struct {
 type Monitor interface {
 	// Send a message to observers
 	Send(msg Message)
-	// NewObjser returns a new Observer containing a channel that will send the
+	// NewObserver returns a new Observer containing a channel that will send the
 	// messages for every command processed by the service.
 	// Stop the observer to release associated resources.
 	NewObserver() Observer
@@ -2792,14 +2793,14 @@ func (s *service) Auth(auth string) error {
 // The Send function sends command args to the service and return a future
 // receiver for getting the response.
 // There are three type of commands: write, read, and system.
-// - Write commands always go though the raft log one at a time.
-// - Read commands do not go though the raft log but do need to be executed
+// - Write commands always go through the raft log one at a time.
+// - Read commands do not go through the raft log but do need to be executed
 //   on the leader. Many reads from multiple clients can execute at the same
 //   time, but each read must wait until the leader has applied at least one
 //   new tick (which acts as a barrier) and must wait for any pending writes
 //   that the same client has issued to be fully applied before executing the
 //   read.
-// - System commands run independently from the machine or user data space, and
+// - System commands run independently of the machine or user data space, and
 //   are primarily used for executing lower level system operations such as
 //   Raft functions, backups, server stats, etc.
 //
@@ -2833,6 +2834,21 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	}
 	switch cmd.kind {
 	case 'w': // write
+		leaderAddr := s.ra.Leader()
+		if  s.ra.State() != raft.Leader {
+			// Leader is maybe remote or down, let's try to call it
+			s.Log().Debug("Forwarding command to active leader")
+			r := &remoteWriteRequestFuture{
+				s: s,
+				leaderAddr: string(leaderAddr),
+				args: args,
+				from: opts.From,
+			}
+			r.wg.Add(1)
+			go r.run()
+			return r
+		}
+
 		r := &writeRequestFuture{args: args, s: s, from: opts.From}
 		r.wg.Add(1)
 		s.m.wrC <- r
@@ -2955,7 +2971,7 @@ func Response(v interface{}, elapsed time.Duration, err error) Receiver {
 	return &simpleResponse{v, elapsed, err}
 }
 
-// writeRequestFuture is the basic unity of communication from services to the
+// writeRequestFuture is the basic unit of communication from services to the
 // raft log. It's a Future type that is sent through a channel, picked up by a
 // background routine that then applies the `args` to the raft log. Upon
 // successfully being applied, the `resp` is fill with the response, and
@@ -2979,6 +2995,54 @@ func (r *writeRequestFuture) Recv() (interface{}, time.Duration, error) {
 		delete(r.s.write, r.from)
 	}
 	r.s.writeMu.Unlock()
+	return r.resp, r.elap, r.err
+}
+
+// remoteWriteRequestFuture is similar to writeRequestFuture but instead calls a remote node.
+type remoteWriteRequestFuture struct {
+	leaderAddr string
+	args []string
+	resp interface{}
+	err  error
+	elap time.Duration
+	wg   sync.WaitGroup
+	s *service
+	from interface{}
+}
+
+func (r *remoteWriteRequestFuture) run() {
+	defer r.wg.Done()
+	defer func(start time.Time) {
+		r.elap = time.Since(start)
+	}(time.Now())
+
+	// TODO: Make this configurable.
+	c, err := redis.Dial("tcp", r.leaderAddr, redis.DialConnectTimeout(5 * time.Second))
+	if err != nil {
+		r.err = err
+		return
+	}
+	defer c.Close()
+
+	cmd := r.args[0]
+	args := make([]interface{}, 0, len(r.args))
+	for i := 1; i < len(r.args); i++ {
+		args = append(args, r.args[i])
+	}
+	r.s.Log().Debugf("Sending command to leader at %s", r.leaderAddr)
+	resp, err := c.Do(cmd, args...)
+	if err != nil {
+		r.s.Log().Errorf("Error on forward: %s", err)
+		r.err = err
+		return
+	}
+
+	// TODO: Make sure the returned value is of a correct type
+	r.resp, _ = redis.Bytes(resp, nil)
+}
+
+func (r *remoteWriteRequestFuture) Recv() (interface{}, time.Duration, error) {
+	r.wg.Wait()
 	return r.resp, r.elap, r.err
 }
 
@@ -3100,7 +3164,6 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 }
 
 func redisServiceHandler(s Service, ln net.Listener) {
-
 	s.Log().Fatal(redcon.Serve(ln,
 		// handle commands
 		func(conn redcon.Conn, cmd redcon.Command) {
