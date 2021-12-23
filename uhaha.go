@@ -69,6 +69,14 @@ func Main(conf Config) {
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
 	go runTicker(conf, tm, m, ra, log)
 
+	if conf.AutoEjectServers {
+		raftObservationCh := make(chan raft.Observation)
+		go heartbeatReadLoop(ra, raftObservationCh)
+		go runAutoEject(conf, ra, log)
+		ob := raft.NewObserver(raftObservationCh, false, heartbeatObservationFilter)
+		ra.RegisterObserver(ob)
+	}
+
 	log.Fatal(svr.serve())
 }
 
@@ -92,6 +100,17 @@ Security options:
 
 Networking options: 
   --advertise addr : advertise address  (default: network bound address)
+
+Cluster Management options:
+  --auto-eject-servers         : turn on automatic ejection of server when
+                                 heartbeat fails.
+  --server-failure-limit count : when --auto-eject-servers enabled, servers
+                                 exceed threshold will be marked for ejection.
+                                 (default: 30)
+  --server-contact-timeout dur : when --auto-eject-servers enabled, servers
+                                 passed specified duration from last heartbeat
+                                 contact time will be marked for ejection.
+                                 (default: 15m)
 
 Advanced options:
   --nosync         : turn off syncing data to disk after every write. This leads
@@ -192,26 +211,29 @@ type Config struct {
 	// connection has been closed on this machine.
 	ConnClosed func(context interface{}, addr string)
 
-	LocalTime   bool          // default false
-	TickDelay   time.Duration // default 200ms
-	BackupPath  string        // default ""
-	InitialData interface{}   // default nil
-	NodeID      string        // default "1"
-	Addr        string        // default ":11001"
-	DataDir     string        // default "data"
-	LogOutput   io.Writer     // default os.Stderr
-	LogLevel    string        // default "notice"
-	JoinAddr    string        // default ""
-	Backend     Backend       // default LevelDB
-	NoSync      bool          // default false
-	OpenReads   bool          // default false
-	MaxPool     int           // default 8
-	TLSCertPath string        // default ""
-	TLSKeyPath  string        // default ""
-	Auth        string        // default ""
-	Advertise   string        // default ""
-	TryErrors   bool          // default false (return TRY instead of MOVED)
-	InitRunQuit bool          // default false
+	LocalTime            bool          // default false
+	TickDelay            time.Duration // default 200ms
+	BackupPath           string        // default ""
+	InitialData          interface{}   // default nil
+	NodeID               string        // default "1"
+	Addr                 string        // default ":11001"
+	DataDir              string        // default "data"
+	LogOutput            io.Writer     // default os.Stderr
+	LogLevel             string        // default "notice"
+	JoinAddr             string        // default ""
+	Backend              Backend       // default LevelDB
+	NoSync               bool          // default false
+	OpenReads            bool          // default false
+	MaxPool              int           // default 8
+	TLSCertPath          string        // default ""
+	TLSKeyPath           string        // default ""
+	Auth                 string        // default ""
+	Advertise            string        // default ""
+	TryErrors            bool          // default false (return TRY instead of MOVED)
+	InitRunQuit          bool          // default false
+	AutoEjectServers     bool          // default false
+	ServerFailureLimit   int           // default 30
+	ServerContactTimeout time.Duration // default 15m
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -255,6 +277,12 @@ func (conf *Config) def() {
 	if conf.MaxPool == 0 {
 		conf.MaxPool = 8
 	}
+	if conf.ServerFailureLimit == 0 {
+		conf.ServerFailureLimit = 30
+	}
+	if conf.ServerContactTimeout == 0 {
+		conf.ServerContactTimeout = time.Minute * 15
+	}
 }
 
 func confInit(conf *Config) {
@@ -290,6 +318,7 @@ func confInit(conf *Config) {
 	}
 	var backend string
 	var testNode string
+	var serverContactTimeout string
 	var vers bool
 	flag.BoolVar(&vers, "v", false, "")
 	flag.StringVar(&conf.Addr, "a", conf.Addr, "")
@@ -309,6 +338,9 @@ func confInit(conf *Config) {
 	flag.StringVar(&testNode, "t", "", "")
 	flag.BoolVar(&conf.TryErrors, "try-errors", conf.TryErrors, "")
 	flag.BoolVar(&conf.InitRunQuit, "init-run-quit", conf.InitRunQuit, "")
+	flag.BoolVar(&conf.AutoEjectServers, "auto-eject-servers", conf.AutoEjectServers, "")
+	flag.IntVar(&conf.ServerFailureLimit, "server-failure-limit", conf.ServerFailureLimit, "")
+	flag.StringVar(&serverContactTimeout, "server-contact-timeout", conf.ServerContactTimeout.String(), "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
 	}
@@ -361,6 +393,14 @@ func confInit(conf *Config) {
 			fmt.Fprintf(os.Stderr, "flat --advertise port number invalid\n")
 			os.Exit(1)
 		}
+	}
+	if serverContactTimeout != "" {
+		dur, err := time.ParseDuration(serverContactTimeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --server-contact-timeout:'%s'\n", serverContactTimeout)
+			os.Exit(1)
+		}
+		conf.ServerContactTimeout = dur
 	}
 	if conf.Flag.PostParse != nil {
 		conf.Flag.PostParse()
@@ -950,12 +990,18 @@ type serverExtra struct {
 	lastError  error  // last error, if any
 }
 
+type serverLiveness struct {
+	hbFailedCount int
+	hbLastContact time.Time
+}
+
 type raftWrap struct {
 	*raft.Raft
 	conf      Config
 	advertise string
 	mu        sync.RWMutex
 	extra     map[string]serverExtra
+	liveness  map[raft.ServerID]serverLiveness
 }
 
 func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
@@ -1067,6 +1113,122 @@ func runMaintainServers(ra *raftWrap) {
 		}
 		wg.Wait()
 		time.Sleep(time.Second)
+	}
+}
+
+func heartbeatObservationFilter(o *raft.Observation) bool {
+	if _, ok := o.Data.(raft.FailedHeartbeatObservation); ok {
+		return true
+	}
+	if _, ok := o.Data.(raft.ResumedHeartbeatObservation); ok {
+		return true
+	}
+	return false
+}
+
+func heartbeatReadLoop(ra *raftWrap, ch chan raft.Observation) {
+	for {
+		select {
+		case o, ok := <-ch:
+			if ok != true {
+				return
+			}
+
+			if ra.State() != raft.Leader {
+				continue
+			}
+
+			ra.mu.Lock()
+			if ra.liveness == nil {
+				ra.liveness = make(map[raft.ServerID]serverLiveness)
+			}
+
+			switch v := o.Data.(type) {
+			case raft.FailedHeartbeatObservation:
+				failed := v
+				s := ra.liveness[failed.PeerID]
+				s.hbFailedCount += 1
+				s.hbLastContact = failed.LastContact
+				ra.liveness[failed.PeerID] = s
+			case raft.ResumedHeartbeatObservation:
+				resume := v
+				delete(ra.liveness, resume.PeerID)
+			}
+			ra.mu.Unlock()
+		}
+	}
+}
+
+func runAutoEject(conf Config, ra *raftWrap, log *redlog.Logger) {
+	if ra.advertise == "" {
+		return
+	}
+
+	lastStateLeader := false
+	for {
+		time.Sleep(time.Second)
+
+		if ra.State() != raft.Leader {
+			lastStateLeader = false
+			continue
+		}
+
+		if lastStateLeader != true {
+			// promoted to leader.
+			// if current Node has been leader in past,
+			// it may have ra.liveness retained, so clear it.
+			ra.mu.Lock()
+			ra.liveness = nil
+			ra.mu.Unlock()
+			lastStateLeader = true
+			continue
+		}
+
+		//
+		// remove failed servers while compare to current server list
+		//
+		servers, err := ra.getServerList()
+		if err != nil {
+			continue
+		}
+
+		ra.mu.RLock()
+		if ra.liveness == nil {
+			ra.mu.RUnlock()
+			continue
+		}
+
+		now := time.Now()
+		ejectHosts := make([]raft.ServerID, 0, len(ra.liveness))
+		for _, entry := range servers {
+			id := raft.ServerID(entry.id)
+			liveness, ok := ra.liveness[id]
+			if ok != true {
+				continue // live server
+			}
+
+			if conf.ServerFailureLimit < liveness.hbFailedCount {
+				timeout := liveness.hbLastContact.Add(conf.ServerContactTimeout)
+				if now.After(timeout) {
+					ejectHosts = append(ejectHosts, id)
+				}
+			}
+		}
+		ra.mu.RUnlock()
+
+		for _, id := range ejectHosts {
+			ra.mu.Lock()
+			c := ra.liveness[id].hbLastContact
+			delete(ra.liveness, id)
+			ra.mu.Unlock()
+
+			log.Printf("server-id=%s ejected, heartbeat last contact: %s", id, c)
+			f := ra.RemoveServer(id, 0, 0)
+			if err := f.Error(); err != nil {
+				log.Printf("server remove failed: %+v", err)
+				continue // retry next
+			}
+		}
 	}
 }
 
