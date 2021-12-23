@@ -7,6 +7,7 @@ package uhaha
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
@@ -21,12 +22,14 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/golang/snappy"
@@ -48,7 +51,11 @@ import (
 // transferred.
 func Main(conf Config) {
 	confInit(&conf)
-	conf.AddService(redisService())
+
+	ctx, cancel := signal.NotifyContext(context.Background(), conf.ServerShutdownSignals...)
+	defer cancel()
+
+	conf.AddService(redisService(ctx))
 
 	hclogger, log := logInit(conf)
 	tm := remoteTimeInit(conf, log)
@@ -64,12 +71,22 @@ func Main(conf Config) {
 	joinClusterIfNeeded(conf, ra, addr, tlscfg, log)
 	startUserServices(conf, svr, m, ra, log)
 
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go runAndWaitShutdown(ctx, conf, wg, ra, svr, log)
+
 	go runMaintainServers(ra)
 	go runWriteApplier(conf, m, ra)
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
 	go runTicker(conf, tm, m, ra, log)
 
-	log.Fatal(svr.serve())
+	if err := svr.serve(ctx); err != nil {
+		if err == context.Canceled {
+			return
+		}
+		log.Fatal(err)
+	}
+	wg.Wait()
 }
 
 const usage = `{{NAME}} version: {{VERSION}} ({{GITSHA}})
@@ -192,26 +209,28 @@ type Config struct {
 	// connection has been closed on this machine.
 	ConnClosed func(context interface{}, addr string)
 
-	LocalTime   bool          // default false
-	TickDelay   time.Duration // default 200ms
-	BackupPath  string        // default ""
-	InitialData interface{}   // default nil
-	NodeID      string        // default "1"
-	Addr        string        // default ":11001"
-	DataDir     string        // default "data"
-	LogOutput   io.Writer     // default os.Stderr
-	LogLevel    string        // default "notice"
-	JoinAddr    string        // default ""
-	Backend     Backend       // default LevelDB
-	NoSync      bool          // default false
-	OpenReads   bool          // default false
-	MaxPool     int           // default 8
-	TLSCertPath string        // default ""
-	TLSKeyPath  string        // default ""
-	Auth        string        // default ""
-	Advertise   string        // default ""
-	TryErrors   bool          // default false (return TRY instead of MOVED)
-	InitRunQuit bool          // default false
+	LocalTime                 bool          // default false
+	TickDelay                 time.Duration // default 200ms
+	BackupPath                string        // default ""
+	InitialData               interface{}   // default nil
+	NodeID                    string        // default "1"
+	Addr                      string        // default ":11001"
+	DataDir                   string        // default "data"
+	LogOutput                 io.Writer     // default os.Stderr
+	LogLevel                  string        // default "notice"
+	JoinAddr                  string        // default ""
+	Backend                   Backend       // default LevelDB
+	NoSync                    bool          // default false
+	OpenReads                 bool          // default false
+	MaxPool                   int           // default 8
+	TLSCertPath               string        // default ""
+	TLSKeyPath                string        // default ""
+	Auth                      string        // default ""
+	Advertise                 string        // default ""
+	TryErrors                 bool          // default false (return TRY instead of MOVED)
+	InitRunQuit               bool          // default false
+	ServerShutdownSignals     []os.Signal   // default [syscall.SIGINT, syscall.SIGTERM]
+	LeadershipTransferSignals []os.Signal   // default []
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -254,6 +273,9 @@ func (conf *Config) def() {
 	}
 	if conf.MaxPool == 0 {
 		conf.MaxPool = 8
+	}
+	if len(conf.ServerShutdownSignals) == 0 {
+		conf.ServerShutdownSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 	}
 }
 
@@ -1027,6 +1049,45 @@ func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 	return servers, nil
 }
 
+func runAndWaitShutdown(ctx context.Context, conf Config, wg *sync.WaitGroup,
+	ra *raftWrap, svr *splitServer, log *redlog.Logger,
+) {
+	defer wg.Done()
+	<-ctx.Done()
+
+	// stop listener.Listen
+	if err := svr.ln.Close(); err != nil {
+		log.Error(err)
+	}
+
+	if ra.State() == raft.Leader {
+		log.Notice("try transfer leadership")
+
+		c := ra.GetConfiguration()
+		if err := c.Error(); err != nil {
+			log.Errorf("could not get Raft configuration: %v", err)
+		} else {
+			cfg := c.Configuration()
+			// has peer
+			if 1 < len(cfg.Servers) {
+				transfer := ra.LeadershipTransfer()
+				if err := transfer.Error(); err != nil {
+					log.Error(err)
+				} else {
+					ra.RemoveServer(raft.ServerID(conf.NodeID), 0, 0)
+				}
+			}
+		}
+	}
+
+	log.Notice("raft shutdown")
+	f := ra.Shutdown()
+	if err := f.Error(); err != nil {
+		log.Error(err)
+	}
+	log.Notice("server shutdown")
+}
+
 func runMaintainServers(ra *raftWrap) {
 	if ra.advertise == "" {
 		return
@@ -1451,10 +1512,29 @@ func newSplitServer(ln net.Listener, log *redlog.Logger) *splitServer {
 	return &splitServer{ln: ln, log: log}
 }
 
-func (m *splitServer) serve() error {
+func (m *splitServer) serve(ctx context.Context) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // shutdown signal
+		default:
+			// nop
+		}
+
 		c, err := m.ln.Accept()
 		if err != nil {
+			contextClosed := false
+			select {
+			case <-ctx.Done():
+				contextClosed = true
+			default:
+			}
+
+			// avoid logging 'use of closed network connection'
+			if contextClosed && errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+
 			if m.log != nil {
 				m.log.Error(err)
 			}
@@ -2982,8 +3062,8 @@ func (r *writeRequestFuture) Recv() (interface{}, time.Duration, error) {
 }
 
 // redisService provides a service that is compatible with the Redis protocol.
-func redisService() (func(io.Reader) bool, func(Service, net.Listener)) {
-	return nil, redisServiceHandler
+func redisService(ctx context.Context) (func(io.Reader) bool, func(Service, net.Listener)) {
+	return nil, redisServiceHandler(ctx)
 }
 
 type redisClient struct {
@@ -3098,40 +3178,55 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 	}
 }
 
-func redisServiceHandler(s Service, ln net.Listener) {
-
-	s.Log().Fatal(redcon.Serve(ln,
-		// handle commands
-		func(conn redcon.Conn, cmd redcon.Command) {
-			client := conn.Context().(*redisClient)
-			var args [][]string
-			args = append(args, redisCommandToArgs(cmd))
-			for _, cmd := range conn.ReadPipeline() {
+func redisServiceHandler(ctx context.Context) func(Service, net.Listener) {
+	return func(s Service, ln net.Listener) {
+		svr := redcon.NewServerNetwork(
+			ln.Addr().Network(), ln.Addr().String(),
+			// handle commands
+			func(conn redcon.Conn, cmd redcon.Command) {
+				client := conn.Context().(*redisClient)
+				var args [][]string
 				args = append(args, redisCommandToArgs(cmd))
-			}
-			redisServiceExecArgs(s, client, conn, args)
-		},
-		// handle opened connection
-		func(conn redcon.Conn) bool {
-			context, accept := s.Opened(conn.RemoteAddr())
-			if !accept {
-				return false
-			}
-			client := new(redisClient)
-			client.opts.From = client
-			client.opts.Context = context
-			conn.SetContext(client)
-			return true
-		},
-		// handle closed connection
-		func(conn redcon.Conn, err error) {
-			if conn.Context() == nil {
-				return
-			}
-			client := conn.Context().(*redisClient)
-			s.Closed(client.opts.Context, conn.RemoteAddr())
-		}),
-	)
+				for _, cmd := range conn.ReadPipeline() {
+					args = append(args, redisCommandToArgs(cmd))
+				}
+				redisServiceExecArgs(s, client, conn, args)
+			},
+			// handle opened connection
+			func(conn redcon.Conn) bool {
+				select {
+				case <-ctx.Done(): // signal happen
+					return false
+				default:
+					// nop
+				}
+
+				context, accept := s.Opened(conn.RemoteAddr())
+				if !accept {
+					return false
+				}
+				client := new(redisClient)
+				client.opts.From = client
+				client.opts.Context = context
+				conn.SetContext(client)
+				return true
+			},
+			// handle closed connection
+			func(conn redcon.Conn, err error) {
+				if conn.Context() == nil {
+					return
+				}
+				client := conn.Context().(*redisClient)
+				s.Closed(client.opts.Context, conn.RemoteAddr())
+			},
+		)
+		go func() {
+			<-ctx.Done()
+			s.Log().Noticef("redis service close")
+			svr.Close()
+		}()
+		s.Log().Fatal(svr.Serve(ln))
+	}
 }
 
 // FilterArgs ...
