@@ -72,8 +72,9 @@ func Main(conf Config) {
 	startUserServices(conf, svr, m, ra, log)
 
 	wg := new(sync.WaitGroup)
-	wg.Add(1)
-	go runAndWaitShutdown(ctx, conf, wg, ra, svr, log)
+	wg.Add(2)
+	go runLeadershipTransfer(wg, ctx, conf, ra, log)
+	go runAndWaitShutdown(wg, ctx, conf, tlscfg, ra, svr, log)
 
 	go runMaintainServers(ra)
 	go runWriteApplier(conf, m, ra)
@@ -230,7 +231,7 @@ type Config struct {
 	TryErrors                 bool          // default false (return TRY instead of MOVED)
 	InitRunQuit               bool          // default false
 	ServerShutdownSignals     []os.Signal   // default [syscall.SIGINT, syscall.SIGTERM]
-	LeadershipTransferSignals []os.Signal   // default []
+	LeadershipTransferSignals []os.Signal   // default [syscall.SIGUSR2]
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -276,6 +277,9 @@ func (conf *Config) def() {
 	}
 	if len(conf.ServerShutdownSignals) == 0 {
 		conf.ServerShutdownSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	}
+	if len(conf.LeadershipTransferSignals) == 0 {
+		conf.LeadershipTransferSignals = []os.Signal{syscall.SIGUSR2}
 	}
 }
 
@@ -824,6 +828,36 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 		addrStr = addr.String()
 	}
 	cfg := f.Configuration()
+
+	joinCluster := func(joinAddr string, timeout time.Duration) error {
+		for {
+			conn, err := RedisDial(joinAddr, conf.Auth, tlscfg)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			res, err := redis.String(redis.DoWithTimeout(
+				conn, timeout,
+				"raft", "server", "add", conf.NodeID, addrStr,
+			))
+			if err != nil {
+				if strings.HasPrefix(err.Error(), "MOVED ") {
+					parts := strings.Split(err.Error(), " ")
+					if len(parts) == 3 {
+						joinAddr = parts[2]
+						time.Sleep(time.Millisecond * 100)
+						continue
+					}
+				}
+				return err
+			}
+			if res != "1" {
+				return fmt.Errorf("'1', got '%s'", res)
+			}
+			return nil
+		}
+	}
+
 	servers := cfg.Servers
 	if len(servers) == 0 {
 		// Empty configuration. Either bootstrap or join an existing cluster.
@@ -845,66 +879,126 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 			}
 		} else {
 			// Joining an existing cluster
-			joinAddr := conf.JoinAddr
-			log.Noticef("joining existing cluster at %v", joinAddr)
-			err := func() error {
-				for {
-					conn, err := RedisDial(joinAddr, conf.Auth, tlscfg)
-					if err != nil {
-						return err
-					}
-					defer conn.Close()
-					res, err := redis.String(conn.Do("raft", "server", "add",
-						conf.NodeID, addrStr))
-					if err != nil {
-						if strings.HasPrefix(err.Error(), "MOVED ") {
-							parts := strings.Split(err.Error(), " ")
-							if len(parts) == 3 {
-								joinAddr = parts[2]
-								time.Sleep(time.Millisecond * 100)
-								continue
-							}
-						}
-						return err
-					}
-					if res != "1" {
-						return fmt.Errorf("'1', got '%s'", res)
-					}
-					return nil
-				}
-			}()
-			if err != nil {
+			if err := joinCluster(conf.JoinAddr, time.Second*30); err != nil {
 				log.Fatalf("raft server add: %v", err)
 			}
 		}
-	} else {
-		if conf.JoinAddr != "" {
-			log.Warningf("ignoring join request because server already " +
-				"belongs to a cluster")
-		}
-		if ra.advertise != "" {
-			// Check that the address is the same as before
-			found := false
-			same := true
-			before := ra.advertise
-			for _, s := range servers {
-				if string(s.ID) == conf.NodeID {
-					found = true
-					if string(s.Address) != ra.advertise {
-						same = false
-						before = string(s.Address)
-						break
-					}
+		return
+	}
+
+	//
+	// cluster existing(maybe server recovery)
+	// check already joined by advertise address
+	//
+	if ra.advertise != "" {
+		// Check that the address is the same as before
+		found := false
+		same := true
+		before := ra.advertise
+		for _, s := range servers {
+			if string(s.ID) == conf.NodeID {
+				found = true
+				if string(s.Address) != ra.advertise {
+					same = false
+					before = string(s.Address)
+					break
 				}
 			}
-			if !found {
-				log.Fatalf("advertise address changed but node not found\n")
-			} else if !same {
-				log.Fatalf("advertise address change from \"%s\" to \"%s\" ",
-					before, ra.advertise)
-			}
+		}
+		if !same {
+			log.Fatalf("advertise address change from \"%s\" to \"%s\" ",
+				before, ra.advertise)
+		}
+		if found {
+			log.Noticef("ignoring join request because server already "+
+				"belongs to a cluster NodeID=\"%s\"", conf.NodeID)
 		}
 	}
+
+	// try join existing configured clusters
+	var lastError error
+	for _, s := range servers {
+		err := joinCluster(string(s.Address), time.Second*10)
+		if err == nil {
+			log.Noticef("joining existing cluster at %v", s.Address)
+			return
+		}
+		lastError = err
+	}
+	if lastError != nil {
+		log.Fatalf("raft server add: %v", lastError)
+	}
+}
+
+func leaveCluster(conf Config, tlscfg *tls.Config, ra *raftWrap) error {
+	f := ra.GetConfiguration()
+	if err := f.Error(); err != nil {
+		return err
+	}
+
+	cfg := f.Configuration()
+	servers := cfg.Servers
+	if len(servers) < 2 {
+		return nil
+	}
+
+	// node is leader then remove self
+	if ra.State() == raft.Leader {
+		f := ra.RemoveServer(raft.ServerID(conf.NodeID), 0, time.Second*10)
+		if err := f.Error(); err != nil {
+			return fmt.Errorf("failed to remove server(id=%s) %v", conf.NodeID, err)
+		}
+		return nil
+	}
+
+	// notify leader node to leave this server.
+	// to reduce unnecessary heartbeat
+	err := func(dur time.Duration) error {
+		leaderAddr := string(ra.Leader())
+		if leaderAddr == "" {
+			leaderAddr = string(servers[0].Address)
+		}
+
+		timeout := time.After(dur)
+		for {
+			select {
+			case <-timeout:
+				return fmt.Errorf("timeout")
+			default:
+				// nop
+			}
+
+			conn, err := RedisDial(leaderAddr, conf.Auth, tlscfg)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+
+			res, err := redis.String(redis.DoWithTimeout(
+				conn, dur,
+				"raft", "server", "remove", conf.NodeID,
+			))
+			if err != nil {
+				if strings.HasPrefix(err.Error(), "MOVED ") {
+					parts := strings.Split(err.Error(), " ")
+					if len(parts) == 3 {
+						leaderAddr = parts[2]
+						time.Sleep(time.Millisecond * 100)
+						continue
+					}
+				}
+				return err
+			}
+			if res != "1" {
+				return fmt.Errorf("'1', got '%s'", res)
+			}
+			return nil
+		}
+	}(time.Second * 10)
+	if err != nil {
+		return fmt.Errorf("raft server remove \"%s\" %v", conf.NodeID, err)
+	}
+	return nil
 }
 
 // RedisDial is a helper function that dials out to another Uhaha server with
@@ -1049,41 +1143,83 @@ func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 	return servers, nil
 }
 
-func runAndWaitShutdown(ctx context.Context, conf Config, wg *sync.WaitGroup,
+var (
+	errServerNotLeader = errors.New("server not leader")
+)
+
+func leadershipTransfer(ra *raftWrap) error {
+	// leader node only
+	if ra.State() != raft.Leader {
+		return errServerNotLeader
+	}
+
+	c := ra.GetConfiguration()
+	if err := c.Error(); err != nil {
+		return err
+	}
+	cfg := c.Configuration()
+	if 1 < len(cfg.Servers) { // has peer
+		transfer := ra.LeadershipTransfer()
+		if err := transfer.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// manually transfer leadership by signals,
+// and make it possible to switch in case of server maintenance, etc.
+func runLeadershipTransfer(wg *sync.WaitGroup, parent context.Context,
+	conf Config, ra *raftWrap, log *redlog.Logger,
+) {
+	defer wg.Done()
+
+	for {
+		ctx, cancel := signal.NotifyContext(context.Background(), conf.LeadershipTransferSignals...)
+		defer cancel()
+
+		select {
+		case <-parent.Done(): // server shutdown
+			return
+		case <-ctx.Done():
+			if err := leadershipTransfer(ra); err != nil {
+				if errors.Is(err, errServerNotLeader) {
+					log.Notice("server is not leader, skip signal")
+					continue
+				}
+				log.Errorf("failed to leadership transfer %v", err)
+			}
+		}
+	}
+}
+
+// handle server shutdown, terminating functions as safely as possible.
+func runAndWaitShutdown(wg *sync.WaitGroup, ctx context.Context,
+	conf Config, tlscfg *tls.Config,
 	ra *raftWrap, svr *splitServer, log *redlog.Logger,
 ) {
 	defer wg.Done()
-	<-ctx.Done()
+	<-ctx.Done() // wait signal
 
 	// stop listener.Listen
 	if err := svr.ln.Close(); err != nil {
 		log.Error(err)
 	}
 
-	if ra.State() == raft.Leader {
-		log.Notice("try transfer leadership")
-
-		c := ra.GetConfiguration()
-		if err := c.Error(); err != nil {
-			log.Errorf("could not get Raft configuration: %v", err)
-		} else {
-			cfg := c.Configuration()
-			// has peer
-			if 1 < len(cfg.Servers) {
-				transfer := ra.LeadershipTransfer()
-				if err := transfer.Error(); err != nil {
-					log.Error(err)
-				} else {
-					ra.RemoveServer(raft.ServerID(conf.NodeID), 0, 0)
-				}
-			}
+	if err := leadershipTransfer(ra); err != nil {
+		if errors.Is(err, errServerNotLeader) != true {
+			log.Errorf("failed to leadership transfer %v", err)
 		}
 	}
 
-	log.Notice("raft shutdown")
-	f := ra.Shutdown()
-	if err := f.Error(); err != nil {
-		log.Error(err)
+	time.Sleep(time.Second)
+
+	if err := leaveCluster(conf, tlscfg, ra); err != nil {
+		log.Errorf("failed to leave cluster %v", err)
+	}
+
+	if err := ra.Shutdown().Error(); err != nil {
+		log.Error("failed to raft shutdown %v", err)
 	}
 	log.Notice("server shutdown")
 }
