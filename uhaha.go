@@ -52,8 +52,8 @@ import (
 func Main(conf Config) {
 	confInit(&conf)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), conf.ServerShutdownSignals...)
-	defer cancel()
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
 
 	conf.AddService(redisService(ctx))
 
@@ -74,7 +74,7 @@ func Main(conf Config) {
 	wg := new(sync.WaitGroup)
 	wg.Add(2)
 	go runLeadershipTransfer(wg, ctx, conf, ra, log)
-	go runAndWaitShutdown(wg, ctx, conf, tlscfg, ra, svr, log)
+	go runAndWaitShutdown(wg, ctx, stop, conf, tlscfg, ra, svr, log)
 
 	go runMaintainServers(ra)
 	go runWriteApplier(conf, m, ra)
@@ -1194,17 +1194,16 @@ func runLeadershipTransfer(wg *sync.WaitGroup, parent context.Context,
 }
 
 // handle server shutdown, terminating functions as safely as possible.
-func runAndWaitShutdown(wg *sync.WaitGroup, ctx context.Context,
-	conf Config, tlscfg *tls.Config,
-	ra *raftWrap, svr *splitServer, log *redlog.Logger,
+func runAndWaitShutdown(wg *sync.WaitGroup, parent context.Context,
+	stop context.CancelFunc, conf Config, tlscfg *tls.Config, ra *raftWrap,
+	svr *splitServer, log *redlog.Logger,
 ) {
 	defer wg.Done()
-	<-ctx.Done() // wait signal
 
-	// stop listener.Listen
-	if err := svr.ln.Close(); err != nil {
-		log.Error(err)
-	}
+	ctx, cancel := signal.NotifyContext(parent, conf.ServerShutdownSignals...)
+	defer cancel()
+
+	<-ctx.Done() // wait signal
 
 	if err := leadershipTransfer(ra); err != nil {
 		if errors.Is(err, errServerNotLeader) != true {
