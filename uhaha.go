@@ -1217,9 +1217,14 @@ func runAndWaitShutdown(wg *sync.WaitGroup, parent context.Context,
 		log.Errorf("failed to leave cluster %v", err)
 	}
 
-	if err := ra.Shutdown().Error(); err != nil {
-		log.Error("failed to raft shutdown %v", err)
+	// broadcast stop redis context
+	stop()
+
+	// stop listener.Listen
+	if err := svr.ln.Close(); err != nil {
+		log.Error(err)
 	}
+
 	log.Notice("server shutdown")
 }
 
