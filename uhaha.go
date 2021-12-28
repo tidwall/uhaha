@@ -1160,10 +1160,6 @@ func heartbeatReadLoop(ra *raftWrap, ch chan raft.Observation) {
 }
 
 func runAutoEject(conf Config, ra *raftWrap, log *redlog.Logger) {
-	if ra.advertise == "" {
-		return
-	}
-
 	lastStateLeader := false
 	for {
 		time.Sleep(time.Second)
