@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,7 +86,7 @@ func genSeed() {
 	rand.Seed(seed)
 }
 
-type instance struct {
+type Instance struct {
 	wg   sync.WaitGroup
 	num  int
 	size int
@@ -93,9 +94,13 @@ type instance struct {
 	cmd  *exec.Cmd
 }
 
-func startInstance(num, size int, wg *sync.WaitGroup) *instance {
+func (i *Instance) PID() int {
+	return i.cmd.Process.Pid
+}
+
+func startInstance(num, size int, wg *sync.WaitGroup) *Instance {
 	output := os.Getenv("OUTPUT_LOGS") != ""
-	inst := &instance{num: num, size: size}
+	inst := &Instance{num: num, size: size}
 	inst.wg.Add(1)
 	path, err := ioutil.TempDir("", "")
 	if err != nil {
@@ -176,14 +181,14 @@ func randStr(n int) string {
 
 type TestClusterContext interface {
 	Monitor(size int)
-	Start(size, numClients int)
+	Start(size, numClients int, insts []*Instance)
 	ExecClient(size int, clientNum int, c *TestConn)
 }
 
 func testSingleCluster(size int, ctx TestClusterContext, numClients int) {
 	killAll()
 	wlog("::CLUSTER::BEGIN::Size=%d", size)
-	insts := make([]*instance, size)
+	insts := make([]*Instance, size)
 	var wg sync.WaitGroup
 	wg.Add(size)
 	defer func() {
@@ -199,7 +204,7 @@ func testSingleCluster(size int, ctx TestClusterContext, numClients int) {
 	for i := 0; i < size; i++ {
 		insts[i] = startInstance(i+1, size, &wg)
 	}
-	ctx.Start(size, numClients)
+	ctx.Start(size, numClients, insts)
 	var wg2 sync.WaitGroup
 	wg2.Add(numClients)
 	for i := 0; i < numClients; i++ {
@@ -291,7 +296,7 @@ func newNoopTestCluster() *noopTestCluster {
 	return &noopTestCluster{}
 }
 
-func (ctx *noopTestCluster) Start(size int, numClients int) {
+func (ctx *noopTestCluster) Start(size int, numClients int, insts []*Instance) {
 	wlog("::CLUSTER::Run %d clients (NOOP)", numClients)
 }
 
@@ -324,7 +329,7 @@ func newBasicTestCluster() *basicTestCluster {
 	}
 }
 
-func (ctx *basicTestCluster) Start(size int, numClients int) {
+func (ctx *basicTestCluster) Start(size int, numClients int, insts []*Instance) {
 	wlog("::CLUSTER::Run %d clients for %d seconds",
 		numClients, ctx.secsRunTime)
 }
@@ -393,7 +398,7 @@ func newLeaderAdvertiseTestCluster() *leaderAdvertiseTestCluster {
 	return &leaderAdvertiseTestCluster{}
 }
 
-func (ctx *leaderAdvertiseTestCluster) Start(size int, numClients int) {
+func (ctx *leaderAdvertiseTestCluster) Start(size int, numClients int, insts []*Instance) {
 	wlog("::CLUSTER::Run %d clients (LeaderAdvertise)", numClients)
 }
 
