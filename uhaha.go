@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,13 @@ func Main(conf Config) {
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
 	go runTicker(conf, tm, m, ra, log)
 
+	if conf.RouterMode {
+		raftObservationCh := make(chan raft.Observation, 10)
+		go peerChangeReadLoop(conf, ra, tlscfg, log, raftObservationCh)
+		ob := raft.NewObserver(raftObservationCh, false, peerChangeObservationFilter)
+		ra.RegisterObserver(ob)
+	}
+
 	log.Fatal(svr.serve())
 }
 
@@ -109,6 +117,22 @@ Advanced options:
                      operation is ignored when a data directory already exists.
                      Cannot be used with -j flag.
   --init-run-quit  : initialize a bootstrap operation and then quit.
+
+Router options:
+  --router               :  join cluster in Router mode.
+                            in Router mode, it joins the cluster as a non voter,
+                            and commands are forwarded to each node when
+                            executed to router.
+                            WriteCommand will be forwarded to leader node, and
+                            ReadCommand and other commands will be forwarded
+                            to other nodes.
+                            Each node has connection pooling, so you can adjust
+                            pool by specifying --router-pool-size and
+                            --router-pool-max-size.
+  --router-pool-max-size :  do not reuse pooled redis connections after the
+                            specified time. (default: 30s)
+  --router-pool-size     :  size of redis connections pool for
+                            each node. (default: 3000)
 `
 
 // Config is the configuration for managing the behavior of the application.
@@ -192,26 +216,29 @@ type Config struct {
 	// connection has been closed on this machine.
 	ConnClosed func(context interface{}, addr string)
 
-	LocalTime   bool          // default false
-	TickDelay   time.Duration // default 200ms
-	BackupPath  string        // default ""
-	InitialData interface{}   // default nil
-	NodeID      string        // default "1"
-	Addr        string        // default ":11001"
-	DataDir     string        // default "data"
-	LogOutput   io.Writer     // default os.Stderr
-	LogLevel    string        // default "notice"
-	JoinAddr    string        // default ""
-	Backend     Backend       // default LevelDB
-	NoSync      bool          // default false
-	OpenReads   bool          // default false
-	MaxPool     int           // default 8
-	TLSCertPath string        // default ""
-	TLSKeyPath  string        // default ""
-	Auth        string        // default ""
-	Advertise   string        // default ""
-	TryErrors   bool          // default false (return TRY instead of MOVED)
-	InitRunQuit bool          // default false
+	LocalTime             bool          // default false
+	TickDelay             time.Duration // default 200ms
+	BackupPath            string        // default ""
+	InitialData           interface{}   // default nil
+	NodeID                string        // default "1"
+	Addr                  string        // default ":11001"
+	DataDir               string        // default "data"
+	LogOutput             io.Writer     // default os.Stderr
+	LogLevel              string        // default "notice"
+	JoinAddr              string        // default ""
+	Backend               Backend       // default LevelDB
+	NoSync                bool          // default false
+	OpenReads             bool          // default false
+	MaxPool               int           // default 8
+	TLSCertPath           string        // default ""
+	TLSKeyPath            string        // default ""
+	Auth                  string        // default ""
+	Advertise             string        // default ""
+	TryErrors             bool          // default false (return TRY instead of MOVED)
+	InitRunQuit           bool          // default false
+	RouterMode            bool          // default false
+	RouterPoolMaxLifetime time.Duration // default 30s
+	RouterPoolSize        int           // default 3000
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -255,6 +282,12 @@ func (conf *Config) def() {
 	if conf.MaxPool == 0 {
 		conf.MaxPool = 8
 	}
+	if conf.RouterPoolMaxLifetime == 0 {
+		conf.RouterPoolMaxLifetime = time.Second * 30
+	}
+	if conf.RouterPoolSize == 0 {
+		conf.RouterPoolSize = 3000
+	}
 }
 
 func confInit(conf *Config) {
@@ -290,6 +323,7 @@ func confInit(conf *Config) {
 	}
 	var backend string
 	var testNode string
+	var routerPoolMaxLifetime string
 	var vers bool
 	flag.BoolVar(&vers, "v", false, "")
 	flag.StringVar(&conf.Addr, "a", conf.Addr, "")
@@ -309,6 +343,9 @@ func confInit(conf *Config) {
 	flag.StringVar(&testNode, "t", "", "")
 	flag.BoolVar(&conf.TryErrors, "try-errors", conf.TryErrors, "")
 	flag.BoolVar(&conf.InitRunQuit, "init-run-quit", conf.InitRunQuit, "")
+	flag.BoolVar(&conf.RouterMode, "router", conf.RouterMode, "")
+	flag.StringVar(&routerPoolMaxLifetime, "router-pool-max-lifetime", conf.RouterPoolMaxLifetime.String(), "")
+	flag.IntVar(&conf.RouterPoolSize, "router-pool-size", conf.RouterPoolSize, "")
 	if conf.Flag.PreParse != nil {
 		conf.Flag.PreParse()
 	}
@@ -361,6 +398,14 @@ func confInit(conf *Config) {
 			fmt.Fprintf(os.Stderr, "flat --advertise port number invalid\n")
 			os.Exit(1)
 		}
+	}
+	if routerPoolMaxLifetime != "" {
+		dur, err := time.ParseDuration(routerPoolMaxLifetime)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --router-pool-max-lifetime '%s'\n", routerPoolMaxLifetime)
+			os.Exit(1)
+		}
+		conf.RouterPoolMaxLifetime = dur
 	}
 	if conf.Flag.PostParse != nil {
 		conf.Flag.PostParse()
@@ -823,6 +868,16 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 			}
 		} else {
 			// Joining an existing cluster
+			raftServerAddCmd := []interface{}{"server", "add", conf.NodeID, addrStr}
+			if conf.RouterMode {
+				//
+				// if router mode, it will join cluster as a NonVoter.
+				// this is to avoid leader election,
+				// because router can only do forwarding.
+				//
+				raftServerAddCmd = append(raftServerAddCmd, "nv")
+			}
+
 			joinAddr := conf.JoinAddr
 			log.Noticef("joining existing cluster at %v", joinAddr)
 			err := func() error {
@@ -832,8 +887,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 						return err
 					}
 					defer conn.Close()
-					res, err := redis.String(conn.Do("raft", "server", "add",
-						conf.NodeID, addrStr))
+					res, err := redis.String(conn.Do("raft", raftServerAddCmd...))
 					if err != nil {
 						if strings.HasPrefix(err.Error(), "MOVED ") {
 							parts := strings.Split(err.Error(), " ")
@@ -935,7 +989,13 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 			}
 			return 0, s.sniff(rd)
 		})
-		go s.serve(newService(m, ra, conf.Auth), ln)
+		var sv Service
+		if conf.RouterMode {
+			sv = newRouteService(m, ra, conf.Auth)
+		} else {
+			sv = newService(m, ra, conf.Auth)
+		}
+		go s.serve(sv, ln)
 	}
 	if conf.InitRunQuit {
 		log.Notice("init run quit")
@@ -950,12 +1010,148 @@ type serverExtra struct {
 	lastError  error  // last error, if any
 }
 
+type routerRoundrobin struct {
+	pools    []*redisConnPool
+	accepted uint64
+}
+
+func newRouterRoundrobin(pools []*redisConnPool) *routerRoundrobin {
+	return &routerRoundrobin{
+		pools:    pools,
+		accepted: 0,
+	}
+}
+
+func (r *routerRoundrobin) Get() (*redisConnWrap, error) {
+	if len(r.pools) < 1 {
+		return nil, fmt.Errorf("CLUSTERDOWN empty pool")
+	}
+
+	idx := int(atomic.AddUint64(&r.accepted, 1) % uint64(len(r.pools)))
+	return r.pools[idx].Get()
+}
+
+func (r *routerRoundrobin) Put(wrap *redisConnWrap) {
+	for _, pool := range r.pools {
+		if pool.addr == wrap.addr {
+			pool.Put(wrap)
+			return
+		}
+	}
+
+	// not found in r.pools, release it
+	wrap.conn.Close()
+}
+
+func (r *routerRoundrobin) Close() {
+	for _, pool := range r.pools {
+		pool.closeAll()
+	}
+	atomic.StoreUint64(&r.accepted, 0)
+}
+
+func (r *routerRoundrobin) String() string {
+	s := make([]string, len(r.pools))
+	for i, pool := range r.pools {
+		s[i] = pool.String()
+	}
+	return fmt.Sprintf("pools[%s]", strings.Join(s, ","))
+}
+
+type redisConnPool struct {
+	mu          sync.RWMutex
+	addr        string
+	auth        string
+	tlscfg      *tls.Config
+	maxLifetime time.Duration
+	poolSize    int
+	pool        chan *redisConnWrap
+}
+
+func newRedisConnPool(conf Config, addr string, tlscfg *tls.Config) *redisConnPool {
+	return &redisConnPool{
+		addr:        addr,
+		auth:        conf.Auth,
+		tlscfg:      tlscfg,
+		maxLifetime: conf.RouterPoolMaxLifetime,
+		poolSize:    conf.RouterPoolSize,
+		pool:        make(chan *redisConnWrap, conf.RouterPoolSize),
+	}
+}
+
+func (p *redisConnPool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	close(p.pool)
+	for w := range p.pool {
+		w.conn.Close()
+	}
+	p.pool = make(chan *redisConnWrap, p.poolSize)
+}
+
+func (p *redisConnPool) Get() (*redisConnWrap, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	select {
+	case wrap := <-p.pool:
+		// reuse exists pool
+		if time.Now().After(wrap.deadline) != true {
+			return wrap, nil
+		}
+
+		// release maxLifetime exceeded conn
+		wrap.conn.Close()
+	default:
+		// pool empty, new conn
+	}
+
+	c, err := RedisDial(p.addr, p.auth, p.tlscfg)
+	if err != nil {
+		return nil, err
+	}
+	return &redisConnWrap{
+		conn:     c,
+		addr:     p.addr,
+		deadline: time.Now().Add(p.maxLifetime),
+	}, nil
+}
+
+func (p *redisConnPool) Put(wrap *redisConnWrap) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	select {
+	case p.pool <- wrap:
+		// free capacity
+	default:
+		// full capacity, release conn
+		wrap.conn.Close()
+	}
+}
+
+func (p *redisConnPool) String() string {
+	return fmt.Sprintf("{addr:%s,size:%d}", p.addr, p.poolSize)
+}
+
+type redisConnWrap struct {
+	conn     redis.Conn
+	addr     string
+	deadline time.Time
+}
+
+func (r *redisConnWrap) Conn() redis.Conn {
+	return r.conn
+}
+
 type raftWrap struct {
 	*raft.Raft
 	conf      Config
 	advertise string
 	mu        sync.RWMutex
 	extra     map[string]serverExtra
+	route     map[byte]*routerRoundrobin
 }
 
 func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
@@ -1025,6 +1221,154 @@ func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 		servers = append(servers, entry)
 	}
 	return servers, nil
+}
+
+//
+// resetRoute will update router pool.
+// If leaderAddr not specified, use "raft leader" command to get leader node.
+// If node is leader node from Voter node in cluster, it will be added to
+// writer pool, otherwise added to reader pool.
+// In each pool, WriteCommand/ReadCommand transferred to nodes in round-robin.
+//
+func resetRoute(conf Config, ra *raftWrap, tlscfg *tls.Config,
+	log *redlog.Logger, leaderAddr string,
+) error {
+	f := ra.GetConfiguration()
+	if err := f.Error(); err != nil {
+		return err
+	}
+	servers := f.Configuration().Servers
+	if len(servers) < 1 {
+		return fmt.Errorf("cluster not configured")
+	}
+
+	if leaderAddr == "" {
+		addrs := make([]raft.ServerAddress, 0, len(servers))
+		for _, s := range servers {
+			if s.Suffrage == raft.Nonvoter {
+				continue // router
+			}
+			addrs = append(addrs, s.Address)
+		}
+
+		conn, err := RedisDial(string(addrs[0]), conf.Auth, tlscfg)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		res, err := redis.String(conn.Do("raft", "leader"))
+		if err != nil {
+			return err
+		}
+		leaderAddr = res
+	}
+
+	writePools := make([]*redisConnPool, 0, 1)           // leader node only
+	readPools := make([]*redisConnPool, 0, len(servers)) // writer + reader
+	for _, s := range servers {
+		if s.Suffrage == raft.Nonvoter {
+			continue // router
+		}
+
+		addr := string(s.Address)
+		pool := newRedisConnPool(conf, addr, tlscfg)
+		extra, ok := ra.getExtraForAddr(addr)
+		if ok {
+			addr = extra.remoteAddr
+		}
+		if addr == leaderAddr {
+			writePools = append(writePools, pool)
+		}
+		readPools = append(readPools, pool)
+	}
+
+	ra.mu.Lock()
+	if ra.route != nil {
+		for _, rr := range ra.route {
+			rr.Close()
+		}
+	}
+
+	ra.route = make(map[byte]*routerRoundrobin, 2)
+	ra.route['w'] = newRouterRoundrobin(writePools)
+	ra.route['r'] = newRouterRoundrobin(readPools)
+	ra.mu.Unlock()
+
+	log.Noticef("reset router pool(w): %s", ra.route['w'].String())
+	log.Noticef("reset router pool(r): %s", ra.route['r'].String())
+
+	return nil
+}
+
+func peerChangeObservationFilter(o *raft.Observation) bool {
+	if _, ok := o.Data.(raft.LeaderObservation); ok {
+		return true
+	}
+	if _, ok := o.Data.(raft.PeerObservation); ok {
+		return true
+	}
+	return false
+}
+
+//
+// peerChangeReadLoop detects node changes in cluster and updates router pool.
+// It is executed every 3 seconds or when raft.LeaderObservation or
+// raft.PeerObservation event occurs.
+//
+func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
+	log *redlog.Logger, ch chan raft.Observation,
+) {
+	tick := time.NewTicker(time.Second * 3)
+	defer tick.Stop()
+
+	lastHash := "" // initial hash
+	getServerIDHash := func() string {
+		f := ra.GetConfiguration()
+		if err := f.Error(); err != nil {
+			return ""
+		}
+
+		servers := f.Configuration().Servers
+		ids := make([]string, len(servers))
+		for i, s := range servers {
+			if s.Suffrage == raft.Nonvoter {
+				continue // voter only
+			}
+			ids[i] = string(s.ID)
+		}
+		sort.Strings(ids)
+		return strings.Join(ids, ",")
+	}
+
+	for {
+		select {
+		case <-tick.C:
+			hash := getServerIDHash()
+			if lastHash != hash {
+				lastHash = hash
+				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+					log.Errorf("failed to reset router(interval): %s", err.Error())
+				}
+			}
+
+		case o, ok := <-ch:
+			if ok != true {
+				return
+			}
+
+			if ob, isLeaderOb := o.Data.(raft.LeaderObservation); isLeaderOb {
+				if err := resetRoute(conf, ra, tlscfg, log, string(ob.Leader)); err != nil {
+					log.Errorf("failed to reset router(LeaderObservation): %s", err.Error())
+				}
+			} else {
+				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+					log.Errorf("failed to reset router(observation): %s", err.Error())
+				}
+			}
+			lastHash = getServerIDHash()
+		}
+	}
 }
 
 func runMaintainServers(ra *raftWrap) {
@@ -2149,15 +2493,31 @@ func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string,
 	return true, nil
 }
 
-// RAFT SERVER ADD id address
+// RAFT SERVER ADD id address [v|nv]
 // help: Returns true if server added, or error; bool
 func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
-	if len(args) != 5 {
+	if len(args) < 5 {
 		return nil, errWrongNumArgsRaft
 	}
-	err := ra.AddVoter(raft.ServerID(args[3]), raft.ServerAddress(args[4]),
-		0, 0).Error()
+	voter := true
+	if len(args) == 6 {
+		switch strings.ToLower(args[5]) {
+		case "nv": // non voter
+			voter = false
+		case "v": // voter
+			voter = true
+		}
+	}
+
+	serverID := raft.ServerID(args[3])
+	serverAddr := raft.ServerAddress(args[4])
+	var err error
+	if voter {
+		err = ra.AddVoter(serverID, serverAddr, 0, 0).Error()
+	} else {
+		err = ra.AddNonvoter(serverID, serverAddr, 0, 0).Error()
+	}
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
 	}
@@ -2530,7 +2890,7 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 		"RAFT INFO [pattern]",
 
 		"RAFT SERVER LIST",
-		"RAFT SERVER ADD id address",
+		"RAFT SERVER ADD id address [v|nv]",
 		"RAFT SERVER REMOVE id",
 
 		"RAFT SNAPSHOT NOW",
@@ -2937,6 +3297,127 @@ func (s *service) waitWrite(from interface{}) {
 	if r != nil {
 		r.Recv()
 	}
+}
+
+type routeService struct {
+	m    *machine
+	ra   *raftWrap
+	auth string
+	mon  *monitor
+}
+
+func newRouteService(m *machine, ra *raftWrap, auth string) *routeService {
+	return &routeService{
+		m:    m,
+		ra:   ra,
+		auth: auth,
+		mon:  newMonitor(nil),
+	}
+}
+
+func (s *routeService) Monitor() Monitor {
+	return s.mon
+}
+
+func (s *routeService) Log() Logger {
+	return s.m.log
+}
+
+func (s *routeService) Auth(auth string) error {
+	if s.auth != auth {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *routeService) Send(args []string, opts *SendOptions) Receiver {
+	if len(args) == 0 {
+		return Response(nil, 0, nil)
+	}
+	cmdName := strings.ToLower(args[0])
+	cmd, ok := s.m.commands[cmdName]
+	if !ok {
+		if s.m.catchall.kind == 0 {
+			return Response(nil, 0, ErrUnknownCommand)
+		}
+		cmd = s.m.catchall
+	}
+	if cmdName == "tick" {
+		return Response(nil, 0, ErrUnknownCommand)
+	}
+	switch cmd.kind {
+	case 'w':
+		start := time.Now()
+		resp, err := s.execWrite(cmd, args)
+		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
+	case 'r', 's':
+		start := time.Now()
+		resp, err := s.execRead(cmd, args)
+		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
+	default:
+		return Response(nil, 0, errors.New("invalid request"))
+	}
+}
+
+func (s *routeService) Opened(addr string) (context interface{}, accept bool) {
+	if s.m.connOpened != nil {
+		return s.m.connOpened(addr)
+	}
+	return nil, true
+}
+
+func (s *routeService) Closed(context interface{}, addr string) {
+	if s.m.connClosed != nil {
+		s.m.connClosed(context, addr)
+	}
+}
+
+func (s *routeService) execWrite(cmd command, args []string) (interface{}, error) {
+	s.ra.mu.RLock()
+	defer s.ra.mu.RUnlock()
+
+	rr, ok := s.ra.route['w']
+	if ok != true {
+		return nil, errors.New("CLUSTERDOWN cluster writer nodes not initialized")
+	}
+	wrap, err := rr.Get()
+	if err != nil {
+		return nil, err
+	}
+	defer rr.Put(wrap)
+
+	// Due to argument of redic.Conn.Do being (string, ...interface{}),
+	// string slice (args[1:]...) and therefore does not accept,
+	// copy []string to []interface{}
+	iv := make([]interface{}, len(args)-1)
+	for i, v := range args[1:] {
+		iv[i] = v
+	}
+	return wrap.Conn().Do(args[0], iv...)
+}
+
+func (s *routeService) execRead(cmd command, args []string) (interface{}, error) {
+	s.ra.mu.RLock()
+	defer s.ra.mu.RUnlock()
+
+	rr, ok := s.ra.route['r']
+	if ok != true {
+		return nil, errors.New("CLUSTERDOWN cluster reader nodes not initialized")
+	}
+	wrap, err := rr.Get()
+	if err != nil {
+		return nil, err
+	}
+	defer rr.Put(wrap)
+
+	// Due to argument of redic.Conn.Do being (string, ...interface{}),
+	// string slice (args[1:]...) and therefore does not accept,
+	// copy []string to []interface{}
+	iv := make([]interface{}, len(args)-1)
+	for i, v := range args[1:] {
+		iv[i] = v
+	}
+	return wrap.Conn().Do(args[0], iv...)
 }
 
 type simpleResponse struct {
