@@ -132,7 +132,7 @@ Router options:
   --router-pool-max-size :  do not reuse pooled redis connections after the
                             specified time. (default: 30s)
   --router-pool-size     :  size of redis connections pool for
-                            each node. (default: 3000)
+                            each node. (default: 500)
 `
 
 // Config is the configuration for managing the behavior of the application.
@@ -238,7 +238,7 @@ type Config struct {
 	InitRunQuit           bool          // default false
 	RouterMode            bool          // default false
 	RouterPoolMaxLifetime time.Duration // default 30s
-	RouterPoolSize        int           // default 3000
+	RouterPoolSize        int           // default 500
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -286,7 +286,7 @@ func (conf *Config) def() {
 		conf.RouterPoolMaxLifetime = time.Second * 30
 	}
 	if conf.RouterPoolSize == 0 {
-		conf.RouterPoolSize = 3000
+		conf.RouterPoolSize = 500
 	}
 }
 
