@@ -127,7 +127,9 @@ Router options:
                             WriteCommand will be forwarded to leader node, and
                             ReadCommand and other commands will be forwarded
                             to other nodes.
-                            Each node has connection pooling, so you can adjust
+                            also, if using ReadCommand to read from follower,
+                            enable --openreads.
+                            each node has connection pooling, so you can adjust
                             pool by specifying --router-pool-size and
                             --router-pool-max-size.
   --router-pool-max-size :  do not reuse pooled redis connections after the
