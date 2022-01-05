@@ -71,8 +71,9 @@ func Main(conf Config) {
 	go runTicker(conf, tm, m, ra, log)
 
 	if conf.RouterMode {
+		rerouteCh := make(chan struct{}, 0)
 		raftObservationCh := make(chan raft.Observation, 10)
-		go peerChangeReadLoop(conf, ra, tlscfg, log, raftObservationCh)
+		go peerChangeReadLoop(conf, ra, tlscfg, log, rerouteCh, raftObservationCh)
 		ob := raft.NewObserver(raftObservationCh, false, peerChangeObservationFilter)
 		ra.RegisterObserver(ob)
 	}
@@ -1317,7 +1318,7 @@ func peerChangeObservationFilter(o *raft.Observation) bool {
 // raft.PeerObservation event occurs.
 //
 func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
-	log *redlog.Logger, ch chan raft.Observation,
+	log *redlog.Logger, reroute chan struct{}, ch chan raft.Observation,
 ) {
 	tick := time.NewTicker(time.Second * 3)
 	defer tick.Stop()
@@ -1346,11 +1347,19 @@ func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
 		case <-tick.C:
 			hash := getServerIDHash()
 			if lastHash != hash {
-				lastHash = hash
 				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
 					log.Errorf("failed to reset router(interval): %s", err.Error())
+					continue
 				}
+				lastHash = hash
 			}
+
+		case <-reroute:
+			if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+				log.Errorf("failed to reset router(reroute): %s", err.Error())
+				continue
+			}
+			lastHash = getServerIDHash()
 
 		case o, ok := <-ch:
 			if ok != true {
@@ -1360,10 +1369,12 @@ func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
 			if ob, isLeaderOb := o.Data.(raft.LeaderObservation); isLeaderOb {
 				if err := resetRoute(conf, ra, tlscfg, log, string(ob.Leader)); err != nil {
 					log.Errorf("failed to reset router(LeaderObservation): %s", err.Error())
+					continue
 				}
 			} else {
 				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
 					log.Errorf("failed to reset router(observation): %s", err.Error())
+					continue
 				}
 			}
 			lastHash = getServerIDHash()
