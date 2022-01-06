@@ -1234,7 +1234,7 @@ func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 // In each pool, WriteCommand/ReadCommand transferred to nodes in round-robin.
 //
 func resetRoute(conf Config, ra *raftWrap, tlscfg *tls.Config,
-	log *redlog.Logger, leaderAddr string,
+	log *redlog.Logger, reroute chan struct{}, leaderAddr string,
 ) error {
 	f := ra.GetConfiguration()
 	if err := f.Error(); err != nil {
@@ -1267,23 +1267,75 @@ func resetRoute(conf Config, ra *raftWrap, tlscfg *tls.Config,
 		leaderAddr = res
 	}
 
-	writePools := make([]*redisConnPool, 0, 1)           // leader node only
-	readPools := make([]*redisConnPool, 0, len(servers)) // writer + reader
+	writerAddrs := make([]string, 0, 1)            // leader node only
+	readerAddrs := make([]string, 0, len(servers)) // writer + reader
 	for _, s := range servers {
 		if s.Suffrage == raft.Nonvoter {
 			continue // router
 		}
 
 		addr := string(s.Address)
-		pool := newRedisConnPool(conf, addr, tlscfg)
 		extra, ok := ra.getExtraForAddr(addr)
 		if ok {
 			addr = extra.remoteAddr
 		}
 		if addr == leaderAddr {
-			writePools = append(writePools, pool)
+			writerAddrs = append(writerAddrs, addr)
 		}
-		readPools = append(readPools, pool)
+		readerAddrs = append(readerAddrs, addr)
+	}
+
+	// check healthy reader node.
+	// maybe nodes in recovery are not added to reader destination.
+	rerouteLater := false
+	healthyReaderAddrs := make([]string, 0, len(readerAddrs))
+	for _, addr := range readerAddrs {
+		behind, err := getPeerLogBehind(addr, conf.Auth, tlscfg)
+		if err != nil {
+			log.Errorf(
+				"node %s failed to get raft log_behind, mark unhealhty. %s",
+				addr, err.Error(),
+			)
+			continue
+		}
+		if 1 < behind {
+			rerouteLater = true
+			continue
+		}
+		healthyReaderAddrs = append(healthyReaderAddrs, addr)
+	}
+	readerAddrs = healthyReaderAddrs
+
+	if rerouteLater {
+		go func(wait <-chan time.Time) {
+			select {
+			case reroute <- struct{}{}:
+			case <-time.After(time.Second * 3):
+				// timeout, drop
+			}
+		}(time.After(time.Second))
+	}
+
+	// maybe leader down, keep current pool and reroute again
+	if len(writerAddrs) < 1 {
+		go func(wait <-chan time.Time) {
+			<-wait
+			select {
+			case reroute <- struct{}{}:
+			case <-time.After(time.Second * 3):
+				// timeout, drop
+			}
+		}(time.After(time.Second))
+		return fmt.Errorf("leader not found %v", servers)
+	}
+
+	writePools := make([]*redisConnPool, len(writerAddrs))
+	readPools := make([]*redisConnPool, len(readerAddrs))
+	for i, addr := range writerAddrs {
+		writePools[i] = newRedisConnPool(conf, addr, tlscfg)
+	}
+	for i, addr := range readerAddrs {
+		readPools[i] = newRedisConnPool(conf, addr, tlscfg)
 	}
 
 	ra.mu.Lock()
@@ -1302,6 +1354,20 @@ func resetRoute(conf Config, ra *raftWrap, tlscfg *tls.Config,
 	log.Noticef("reset router pool(r): %s", ra.route['r'].String())
 
 	return nil
+}
+
+func getPeerLogBehind(addr, auth string, tlscfg *tls.Config) (uint64, error) {
+	conn, err := RedisDial(addr, auth, tlscfg)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	reply, err := redis.StringMap(conn.Do("raft", "info"))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(reply["logs_behind"], 10, 64)
 }
 
 func peerChangeObservationFilter(o *raft.Observation) bool {
@@ -1349,7 +1415,7 @@ func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
 		case <-tick.C:
 			hash := getServerIDHash()
 			if lastHash != hash {
-				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+				if err := resetRoute(conf, ra, tlscfg, log, reroute, ""); err != nil {
 					log.Errorf("failed to reset router(interval): %s", err.Error())
 					continue
 				}
@@ -1357,7 +1423,7 @@ func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
 			}
 
 		case <-reroute:
-			if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+			if err := resetRoute(conf, ra, tlscfg, log, reroute, ""); err != nil {
 				log.Errorf("failed to reset router(reroute): %s", err.Error())
 				continue
 			}
@@ -1369,12 +1435,12 @@ func peerChangeReadLoop(conf Config, ra *raftWrap, tlscfg *tls.Config,
 			}
 
 			if ob, isLeaderOb := o.Data.(raft.LeaderObservation); isLeaderOb {
-				if err := resetRoute(conf, ra, tlscfg, log, string(ob.Leader)); err != nil {
+				if err := resetRoute(conf, ra, tlscfg, log, reroute, string(ob.Leader)); err != nil {
 					log.Errorf("failed to reset router(LeaderObservation): %s", err.Error())
 					continue
 				}
 			} else {
-				if err := resetRoute(conf, ra, tlscfg, log, ""); err != nil {
+				if err := resetRoute(conf, ra, tlscfg, log, reroute, ""); err != nil {
 					log.Errorf("failed to reset router(observation): %s", err.Error())
 					continue
 				}
