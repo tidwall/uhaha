@@ -3347,7 +3347,19 @@ func (s *routeService) Send(args []string, opts *SendOptions) Receiver {
 	if len(args) == 0 {
 		return Response(nil, 0, nil)
 	}
+	dstLeader := false
 	cmdName := strings.ToLower(args[0])
+
+	//
+	// some commands may be sensitive to replication delays.
+	// command prefixed with "@" should be requested to Leader.
+	//
+	if 1 < len(cmdName) && cmdName[0] == '@' {
+		dstLeader = true
+		cmdName = cmdName[1:]
+		args[0] = args[0][1:]
+	}
+
 	cmd, ok := s.m.commands[cmdName]
 	if !ok {
 		if s.m.catchall.kind == 0 {
@@ -3357,6 +3369,12 @@ func (s *routeService) Send(args []string, opts *SendOptions) Receiver {
 	}
 	if cmdName == "tick" {
 		return Response(nil, 0, ErrUnknownCommand)
+	}
+
+	if dstLeader {
+		start := time.Now()
+		resp, err := s.execWrite(cmd, args)
+		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	}
 	switch cmd.kind {
 	case 'w':
