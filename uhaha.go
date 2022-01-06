@@ -912,6 +912,23 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 		if found {
 			log.Noticef("ignoring join request because server already "+
 				"belongs to a cluster NodeID=\"%s\"", conf.NodeID)
+			return
+		}
+	} else {
+		// check same ID and Address in cluster
+		found := false
+		for _, s := range servers {
+			if string(s.ID) == conf.NodeID {
+				if string(s.Address) == addrStr {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			log.Noticef("ignoring join request because server already "+
+				"belongs to a cluster NodeID=\"%s\"", conf.NodeID)
+			return
 		}
 	}
 
