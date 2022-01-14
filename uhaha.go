@@ -3447,9 +3447,14 @@ func (s *routeService) Send(args []string, opts *SendOptions) Receiver {
 		start := time.Now()
 		resp, err := s.execWrite(cmd, args)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
-	case 'r', 's':
+	case 'r':
 		start := time.Now()
 		resp, err := s.execRead(cmd, args)
+		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
+	case 's':
+		start := time.Now()
+		pm := intermediateMachine{m: s.m, context: opts.Context}
+		resp, err := cmd.fn(pm, s.ra, args)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:
 		return Response(nil, 0, errors.New("invalid request"))
