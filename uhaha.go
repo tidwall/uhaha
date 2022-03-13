@@ -38,7 +38,7 @@ import (
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
 
-	raftboltdb "github.com/hashicorp/raft-boltdb"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
