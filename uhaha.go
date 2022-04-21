@@ -1722,9 +1722,10 @@ type command struct {
 type Machine interface {
 	// Data is the original user data interface that was assigned at startup.
 	// It's safe to alter the data in this interface while inside a Write
-	// command, but it's only safe to read from this interface for Read
-	// commands.
-	// Returns nil for Intermediate Commands.
+	// command, but it's only safe to read the data from this interface for
+	// Read commands.
+	// For Intermediate commands, it's not safe to read or write data from
+	// this interface and you should use at your own risk.
 	Data() interface{}
 	// Now generates a stable timestamp that is synced with internet time
 	// and for Write commands is always monotonical increasing. It's made to
@@ -1955,7 +1956,7 @@ func (m intermediateMachine) Now() time.Time       { return time.Time{} }
 func (m intermediateMachine) Context() interface{} { return m.context }
 func (m intermediateMachine) Log() Logger          { return m.m.log }
 func (m intermediateMachine) Rand() Rand           { return nil }
-func (m intermediateMachine) Data() interface{}    { return nil }
+func (m intermediateMachine) Data() interface{}    { return m.m.data }
 
 func getBaseMachine(m Machine) *machine {
 	switch m := m.(type) {
