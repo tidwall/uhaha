@@ -19,3 +19,5 @@ require (
 	github.com/tidwall/tinybtree v1.0.1
 	golang.org/x/sys v0.0.0-20220310020820-b874c991c1a5 // indirect
 )
+
+require gopkg.in/yaml.v2 v2.2.8 // indirect
