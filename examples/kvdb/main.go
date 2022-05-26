@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tidwall/btree"
 	"github.com/tidwall/match"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/sds"
-	"github.com/tidwall/tinybtree"
 	"github.com/tidwall/uhaha"
 )
 
@@ -26,7 +26,7 @@ func main() {
 	var conf uhaha.Config
 
 	conf.Name = "kvdb"
-	conf.Version = "0.0.1"
+	conf.Version = "0.1.0"
 	conf.InitialData = new(database)
 	conf.Snapshot = snapshot
 	conf.Restore = restore
@@ -51,8 +51,8 @@ type object struct {
 }
 
 type database struct {
-	keys tinybtree.BTree // (key)->(object)
-	exps tinybtree.BTree // [exp/key]->(nil)
+	keys btree.Map[string, *object] // (key)->(object)
+	exps btree.Map[string, *object] // [exp/key]->(nil)
 }
 
 func tick(m uhaha.Machine) {
@@ -60,7 +60,7 @@ func tick(m uhaha.Machine) {
 	exkey := make([]byte, 8)
 	binary.BigEndian.PutUint64(exkey, uint64(m.Now().UnixNano()))
 	var keys []string
-	db.exps.Scan(func(key string, _ interface{}) bool {
+	db.exps.Scan(func(key string, _ *object) bool {
 		if key > string(exkey) {
 			return false
 		}
@@ -73,9 +73,8 @@ func tick(m uhaha.Machine) {
 }
 
 func (db *database) set(o *object) (replaced bool) {
-	v, replaced := db.keys.Set(o.key, o)
+	prev, replaced := db.keys.Set(o.key, o)
 	if replaced {
-		prev := v.(*object)
 		if prev.expires > 0 {
 			_, deleted := db.exps.Delete(prev.exkey())
 			if !deleted {
@@ -90,9 +89,8 @@ func (db *database) set(o *object) (replaced bool) {
 }
 
 func (db *database) del(key string) (prev *object, deleted bool) {
-	v, deleted := db.keys.Delete(key)
+	prev, deleted = db.keys.Delete(key)
 	if deleted {
-		prev := v.(*object)
 		if prev.expires > 0 {
 			_, deleted := db.exps.Delete(prev.exkey())
 			if !deleted {
@@ -105,11 +103,7 @@ func (db *database) del(key string) (prev *object, deleted bool) {
 }
 
 func (db *database) get(key string) (*object, bool) {
-	v, ok := db.keys.Get(key)
-	if ok {
-		return v.(*object), true
-	}
-	return nil, false
+	return db.keys.Get(key)
 }
 
 // SET key value [EX seconds]
@@ -235,14 +229,14 @@ func cmdKEYS(m uhaha.Machine, args []string) (interface{}, error) {
 	var keys []string
 	min, max := match.Allowable(pattern)
 	if min == "" && max == "" {
-		db.keys.Scan(func(key string, _ interface{}) bool {
+		db.keys.Scan(func(key string, _ *object) bool {
 			if match.Match(key, pattern) {
 				keys = append(keys, key)
 			}
 			return true
 		})
 	} else {
-		db.keys.Ascend(min, func(key string, _ interface{}) bool {
+		db.keys.Ascend(min, func(key string, _ *object) bool {
 			if key > max {
 				return false
 			}
@@ -362,8 +356,8 @@ func snapshot(data interface{}) (uhaha.Snapshot, error) {
 	db := data.(*database)
 	snap := new(dbSnapshot)
 	snap.objs = make([]*object, 0, db.keys.Len())
-	db.keys.Scan(func(_ string, v interface{}) bool {
-		snap.objs = append(snap.objs, v.(*object))
+	db.keys.Scan(func(_ string, obj *object) bool {
+		snap.objs = append(snap.objs, obj)
 		return true
 	})
 	return snap, nil
