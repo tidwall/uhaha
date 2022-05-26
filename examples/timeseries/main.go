@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tidwall/btree"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/sds"
-	"github.com/tidwall/tinybtree"
 	"github.com/tidwall/uhaha"
 )
 
@@ -24,7 +24,7 @@ type database struct {
 	totalSets    uint64
 	totalDels    uint64
 	retain       time.Duration
-	measurements tinybtree.BTree
+	measurements btree.Map[string, interface{}]
 }
 
 func main() {
@@ -63,7 +63,7 @@ func tick(m uhaha.Machine) {
 	var delPoints []string
 	var delMeasurements []string
 	db.measurements.Scan(func(measurement string, v interface{}) bool {
-		mdb := v.(*tinybtree.BTree)
+		mdb := v.(*btree.Map[string, interface{}])
 		delPoints = delPoints[:0]
 		mdb.Scan(func(point string, v interface{}) bool {
 			if point > string(base) {
@@ -86,15 +86,15 @@ func tick(m uhaha.Machine) {
 	}
 }
 
-func (db *database) getMDB(measurment string, create bool) *tinybtree.BTree {
+func (db *database) getMDB(measurment string, create bool) *btree.Map[string, interface{}] {
 	v, _ := db.measurements.Get(measurment)
 	if v != nil {
-		return v.(*tinybtree.BTree)
+		return v.(*btree.Map[string, interface{}])
 	}
 	if !create {
 		return nil
 	}
-	mdb := &tinybtree.BTree{}
+	mdb := new(btree.Map[string, interface{}])
 	db.measurements.Set(measurment, mdb)
 	return mdb
 }
@@ -144,7 +144,7 @@ func cmdSTATS(m uhaha.Machine, args []string) (interface{}, error) {
 	db := m.Data().(*database)
 	npoints := 0
 	db.measurements.Scan(func(measurement string, v interface{}) bool {
-		mdb := v.(*tinybtree.BTree)
+		mdb := v.(*btree.Map[string, interface{}])
 		npoints += mdb.Len()
 		return true
 	})
@@ -259,7 +259,7 @@ func snapshot(data interface{}) (uhaha.Snapshot, error) {
 	snap.totalDels = db.totalDels
 	snap.retain = db.retain
 	db.measurements.Scan(func(measurement string, v interface{}) bool {
-		mdb := v.(*tinybtree.BTree)
+		mdb := v.(*btree.Map[string, interface{}])
 		mdb.Scan(func(point string, _ interface{}) bool {
 			snap.points = append(snap.points, snapPoint{measurement, point})
 			return true
@@ -288,7 +288,7 @@ func restore(rd io.Reader) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var mdb *tinybtree.BTree
+	var mdb *btree.Map[string, interface{}]
 	var lastMeasurment string
 	for i := uint64(0); i < n; i++ {
 		measurement, err := r.ReadString()

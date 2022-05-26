@@ -16,7 +16,6 @@ require (
 	github.com/tidwall/rhh v1.3.0
 	github.com/tidwall/rtime v0.2.0
 	github.com/tidwall/sds v0.1.1
-	github.com/tidwall/tinybtree v1.1.0
 )
 
 require (
