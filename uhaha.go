@@ -1744,8 +1744,9 @@ type Machine interface {
 	// Utility logger for printing information to the local server log.
 	Log() Logger
 	// Context returns the connection context that was defined in from the
-	// Config.ConnOpened callback. Only available for Intermediate commands.
-	// Returns nil for Read and Write Commands.
+	// Config.ConnOpened callback.
+	// Only available for Intermediate and Read commands.
+	// Returns nil for Write Commands.
 	Context() interface{}
 }
 
@@ -1944,23 +1945,34 @@ func (m *machine) Now() time.Time {
 	return time.Unix(0, ts).UTC()
 }
 
-// intermediateMachine wraps the machine in a connection context
-type intermediateMachine struct {
+// contextMachine wraps the machine in a connection context.
+type contextMachine struct {
+	reader  bool
 	context interface{}
 	m       *machine
 }
 
-var _ Machine = intermediateMachine{}
+var _ Machine = contextMachine{}
 
-func (m intermediateMachine) Now() time.Time       { return time.Time{} }
-func (m intermediateMachine) Context() interface{} { return m.context }
-func (m intermediateMachine) Log() Logger          { return m.m.log }
-func (m intermediateMachine) Rand() Rand           { return nil }
-func (m intermediateMachine) Data() interface{}    { return m.m.data }
+func (m contextMachine) Now() time.Time {
+	if m.reader {
+		return m.m.Now()
+	}
+	return time.Time{}
+}
+func (m contextMachine) Rand() Rand {
+	if m.reader {
+		return m.m.Rand()
+	}
+	return nil
+}
+func (m contextMachine) Context() interface{} { return m.context }
+func (m contextMachine) Log() Logger          { return m.m.Log() }
+func (m contextMachine) Data() interface{}    { return m.m.Data() }
 
 func getBaseMachine(m Machine) *machine {
 	switch m := m.(type) {
-	case intermediateMachine:
+	case contextMachine:
 		return m.m
 	case *machine:
 		return m
@@ -2846,7 +2858,7 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	case 's': // intermediate/system
 		s.waitWrite(opts.From)
 		start := time.Now()
-		pm := intermediateMachine{m: s.m, context: opts.Context}
+		pm := contextMachine{m: s.m, context: opts.Context}
 		resp, err := cmd.fn(pm, s.ra, args)
 		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
 	default:
@@ -2881,14 +2893,14 @@ func (s *service) execRead(cmd command, args []string, opts *SendOptions,
 	var resp interface{}
 	var err error
 	if openReads {
-		resp, err = s.execOpenRead(cmd, args)
+		resp, err = s.execOpenRead(cmd, args, opts)
 	} else {
-		resp, err = s.execNonOpenRead(cmd, args)
+		resp, err = s.execNonOpenRead(cmd, args, opts)
 	}
 	return resp, err
 }
 
-func (s *service) execOpenRead(cmd command, args []string,
+func (s *service) execOpenRead(cmd command, args []string, opts *SendOptions,
 ) (interface{}, error) {
 	// open reads can be performed on the leaders and followers that have a log
 	// which is reasonably loaded.
@@ -2903,10 +2915,11 @@ func (s *service) execOpenRead(cmd command, args []string,
 		atomic.AddInt32(&s.m.readers, -1)
 		s.m.mu.RUnlock()
 	}()
-	return cmd.fn(s.m, s.ra, args)
+	m := contextMachine{reader: true, context: opts.Context, m: s.m}
+	return cmd.fn(m, s.ra, args)
 }
 
-func (s *service) execNonOpenRead(cmd command, args []string,
+func (s *service) execNonOpenRead(cmd command, args []string, opts *SendOptions,
 ) (interface{}, error) {
 	// Non-open reads can only be performed on a leader that has received
 	// a tick response. In this case a tick acts as a write barrier ensuring
@@ -2922,7 +2935,8 @@ func (s *service) execNonOpenRead(cmd command, args []string,
 	}
 	// We are the leader and we have received a tick event.
 	// Complete the read command.
-	return cmd.fn(s.m, s.ra, args)
+	m := contextMachine{reader: true, context: opts.Context, m: s.m}
+	return cmd.fn(m, s.ra, args)
 }
 
 func (s *service) addWrite(from interface{}, r *writeRequestFuture) {
