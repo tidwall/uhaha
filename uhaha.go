@@ -192,6 +192,10 @@ type Config struct {
 	// connection has been closed on this machine.
 	ConnClosed func(context interface{}, addr string)
 
+	// ResponseFilter is and options function used to filter every response
+	// prior to send into a client connection.
+	ResponseFilter ResponseFilter
+
 	LocalTime   bool          // default false
 	TickDelay   time.Duration // default 200ms
 	BackupPath  string        // default ""
@@ -434,10 +438,12 @@ func (conf *Config) AddWriteCommand(name string,
 
 // AddService adds a custom client network service, such as HTTP or gRPC.
 // By default, a Redis compatible service is already included.
-func (conf *Config) AddService(sniff func(rd io.Reader) bool,
+func (conf *Config) AddService(
+	name string,
+	sniff func(rd io.Reader) bool,
 	acceptor func(s Service, ln net.Listener),
 ) {
-	conf.services = append(conf.services, serviceEntry{sniff, acceptor})
+	conf.services = append(conf.services, serviceEntry{name, sniff, acceptor})
 }
 
 type jsonSnapshotType struct{ jsdata []byte }
@@ -935,7 +941,8 @@ func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
 			}
 			return 0, s.sniff(rd)
 		})
-		go s.serve(newService(m, ra, conf.Auth), ln)
+		filt := conf.ResponseFilter
+		go s.serve(newService(m, ra, conf.Auth, s.name, filt), ln)
 	}
 	if conf.InitRunQuit {
 		log.Notice("init run quit")
@@ -2643,6 +2650,7 @@ var ErrCorrupt = errors.New("corrupt")
 
 // Receiver ...
 type Receiver interface {
+	Args() []string
 	Recv() (interface{}, time.Duration, error)
 }
 
@@ -2746,8 +2754,15 @@ func (m *monitor) NewObserver() Observer {
 	return o
 }
 
+type ResponseFilter func(
+	serviceName string, context interface{},
+	args []string, v interface{},
+) interface{}
+
 // Service is a client facing service.
 type Service interface {
+	// The name of the service
+	Name() string
 	// Send a command with args from a client
 	Send(args []string, opts *SendOptions) Receiver
 	// Auth authorizes a client
@@ -2760,34 +2775,51 @@ type Service interface {
 	Opened(addr string) (context interface{}, accept bool)
 	// Closed
 	Closed(context interface{}, addr string)
+	// ResponseFilter
+	ResponseFilter() ResponseFilter
 }
 
 type serviceEntry struct {
+	name  string
 	sniff func(rd io.Reader) bool
 	serve func(s Service, ln net.Listener)
 }
 
 type service struct {
-	m    *machine
-	ra   *raftWrap
-	auth string
-	mon  *monitor
+	m     *machine
+	ra    *raftWrap
+	auth  string
+	name  string
+	mon   *monitor
+	rfilt ResponseFilter
 
 	writeMu sync.Mutex
 	write   map[interface{}]*writeRequestFuture
 }
 
-func newService(m *machine, ra *raftWrap, auth string) *service {
-	s := &service{m: m, ra: ra, auth: auth}
+var _ Service = &service{}
+
+func newService(m *machine, ra *raftWrap, auth, name string,
+	rfilt ResponseFilter,
+) *service {
+	s := &service{m: m, ra: ra, auth: auth, name: name, rfilt: rfilt}
 	s.write = make(map[interface{}]*writeRequestFuture)
 	s.mon = newMonitor(s)
 	return s
+}
+
+func (s *service) ResponseFilter() ResponseFilter {
+	return s.rfilt
 }
 
 // Monitor allows for observing all incoming service commands from all clients.
 // See an example in the examples/kvdb project.
 func (s *service) Monitor() Monitor {
 	return s.mon
+}
+
+func (s *service) Name() string {
+	return s.name
 }
 
 func (s *service) Log() Logger {
@@ -2822,13 +2854,13 @@ func (s *service) Auth(auth string) error {
 func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	if len(args) == 0 {
 		// Empty command gets an empty response
-		return Response(nil, 0, nil)
+		return Response(args, nil, 0, nil)
 	}
 	cmdName := strings.ToLower(args[0])
 	cmd, ok := s.m.commands[cmdName]
 	if !ok {
 		if s.m.catchall.kind == 0 {
-			return Response(nil, 0, ErrUnknownCommand)
+			return Response(args, nil, 0, ErrUnknownCommand)
 		}
 		cmd = s.m.catchall
 	}
@@ -2836,7 +2868,7 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 		// The "tick" command is explicitly denied from being called by a
 		// service. It must only be called from the runTicker function.
 		// Let's just pretend like it's an unknown command.
-		return Response(nil, 0, ErrUnknownCommand)
+		return Response(args, nil, 0, ErrUnknownCommand)
 	}
 	if opts == nil {
 		// Use the default send options when the sender does not tell us what
@@ -2854,15 +2886,17 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 		s.waitWrite(opts.From)
 		start := time.Now()
 		resp, err := s.execRead(cmd, args, opts)
-		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
+		return Response(args, resp, time.Since(start),
+			errRaftConvert(s.ra, err))
 	case 's': // intermediate/system
 		s.waitWrite(opts.From)
 		start := time.Now()
 		pm := contextMachine{m: s.m, context: opts.Context}
 		resp, err := cmd.fn(pm, s.ra, args)
-		return Response(resp, time.Since(start), errRaftConvert(s.ra, err))
+		return Response(args, resp, time.Since(start),
+			errRaftConvert(s.ra, err))
 	default:
-		return Response(nil, 0, errors.New("invalid request"))
+		return Response(args, nil, 0, errors.New("invalid request"))
 	}
 }
 
@@ -2955,6 +2989,7 @@ func (s *service) waitWrite(from interface{}) {
 }
 
 type simpleResponse struct {
+	args []string
 	v    interface{}
 	elap time.Duration
 	err  error
@@ -2964,9 +2999,14 @@ func (r *simpleResponse) Recv() (interface{}, time.Duration, error) {
 	return r.v, r.elap, r.err
 }
 
+func (r *simpleResponse) Args() []string {
+	return r.args
+}
+
 // Response ...
-func Response(v interface{}, elapsed time.Duration, err error) Receiver {
-	return &simpleResponse{v, elapsed, err}
+func Response(args []string, v interface{}, elapsed time.Duration, err error,
+) Receiver {
+	return &simpleResponse{args, v, elapsed, err}
 }
 
 // writeRequestFuture is the basic unity of communication from services to the
@@ -2984,6 +3024,10 @@ type writeRequestFuture struct {
 	from interface{}
 }
 
+func (r *writeRequestFuture) Args() []string {
+	return r.args
+}
+
 // Recv received the response and time elapsed to process the write. Or, it
 // returns an error.
 func (r *writeRequestFuture) Recv() (interface{}, time.Duration, error) {
@@ -2997,8 +3041,12 @@ func (r *writeRequestFuture) Recv() (interface{}, time.Duration, error) {
 }
 
 // redisService provides a service that is compatible with the Redis protocol.
-func redisService() (func(io.Reader) bool, func(Service, net.Listener)) {
-	return nil, redisServiceHandler
+func redisService() (
+	name string,
+	sniff func(io.Reader) bool,
+	acceptor func(Service, net.Listener),
+) {
+	return "redis", nil, redisServiceHandler
 }
 
 type redisClient struct {
@@ -3020,29 +3068,31 @@ type redisQuitClose struct{}
 func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 	args [][]string,
 ) {
+	sname := s.Name()
+	rfilt := s.ResponseFilter()
 	recvs := make([]Receiver, len(args))
 	var close bool
 	for i, args := range args {
 		var r Receiver
 		switch args[0] {
 		case "quit":
-			r = Response(redisQuitClose{}, 0, nil)
+			r = Response(args, redisQuitClose{}, 0, nil)
 			close = true
 		case "auth":
 			if len(args) != 2 {
-				r = Response(nil, 0, ErrWrongNumArgs)
+				r = Response(args, nil, 0, ErrWrongNumArgs)
 			} else if err := s.Auth(args[1]); err != nil {
 				client.authorized = false
-				r = Response(nil, 0, err)
+				r = Response(args, nil, 0, err)
 			} else {
 				client.authorized = true
-				r = Response(redcon.SimpleString("OK"), 0, nil)
+				r = Response(args, redcon.SimpleString("OK"), 0, nil)
 			}
 		default:
 			if !client.authorized {
 				if err := s.Auth(""); err != nil {
 					client.authorized = false
-					r = Response(nil, 0, err)
+					r = Response(args, nil, 0, err)
 				} else {
 					client.authorized = true
 				}
@@ -3051,20 +3101,21 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 				switch args[0] {
 				case "ping":
 					if len(args) == 1 {
-						r = Response(redcon.SimpleString("PONG"), 0, nil)
+						r = Response(args, redcon.SimpleString("PONG"), 0,
+							nil)
 					} else if len(args) == 2 {
-						r = Response(args[1], 0, nil)
+						r = Response(args, args[1], 0, nil)
 					} else {
-						r = Response(nil, 0, ErrWrongNumArgs)
+						r = Response(args, nil, 0, ErrWrongNumArgs)
 					}
 				case "shutdown":
 					s.Log().Error("Shutting down")
 					os.Exit(0)
 				case "echo":
 					if len(args) != 2 {
-						r = Response(nil, 0, ErrWrongNumArgs)
+						r = Response(args, nil, 0, ErrWrongNumArgs)
 					} else {
-						r = Response(args[1], 0, nil)
+						r = Response(args, args[1], 0, nil)
 					}
 				default:
 					r = s.Send(args, &client.opts)
@@ -3084,7 +3135,7 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 			if err == ErrUnknownCommand {
 				err = fmt.Errorf("%s '%s'", err, args[i][0])
 			}
-			conn.WriteAny(err)
+			redisConnWriteAny(sname, rfilt, conn, client, r.Args(), err)
 		} else {
 			switch v := resp.(type) {
 			case FilterArgs:
@@ -3093,10 +3144,11 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 				conn := newRedisHijackedConn(conn.Detach())
 				go v(s, conn)
 			case redisQuitClose:
-				conn.WriteString("OK")
+				v2 := redcon.SimpleString("OK")
+				redisConnWriteAny(sname, rfilt, conn, client, r.Args(), v2)
 				conn.Close()
 			default:
-				conn.WriteAny(v)
+				redisConnWriteAny(sname, rfilt, conn, client, r.Args(), v)
 			}
 		}
 		// broadcast the request and response to all observers
@@ -3113,8 +3165,21 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 	}
 }
 
-func redisServiceHandler(s Service, ln net.Listener) {
+func redisConnWriteAny(
+	sname string,
+	rfilt ResponseFilter,
+	conn redcon.Conn,
+	client *redisClient,
+	args []string,
+	v interface{},
+) {
+	if rfilt != nil {
+		v = rfilt(sname, client.opts.Context, args, v)
+	}
+	conn.WriteAny(v)
+}
 
+func redisServiceHandler(s Service, ln net.Listener) {
 	s.Log().Fatal(redcon.Serve(ln,
 		// handle commands
 		func(conn redcon.Conn, cmd redcon.Command) {
@@ -3185,6 +3250,7 @@ type HijackedConn interface {
 type redisHijackConn struct {
 	dconn redcon.DetachedConn
 	cmds  []redcon.Command
+	// anyWrap func(v interface{}) []byte
 }
 
 func newRedisHijackedConn(dconn redcon.DetachedConn) *redisHijackConn {
