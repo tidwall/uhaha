@@ -10,7 +10,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.2.2
 	github.com/tidwall/btree v1.3.1
 	github.com/tidwall/match v1.1.1
-	github.com/tidwall/raft-leveldb v0.2.0
+	github.com/tidwall/raft-leveldb v0.2.1
 	github.com/tidwall/redcon v1.4.5
 	github.com/tidwall/redlog/v2 v2.0.4
 	github.com/tidwall/rhh v1.3.0
