@@ -1891,6 +1891,22 @@ func (m *machine) Uint64() uint64 {
 	return (uint64(m.Uint32()) << 32) | uint64(m.Uint32())
 }
 
+const hexchars = "0123456789abcdef"
+
+func (m *machine) UUID() string {
+	var buf [36]byte
+	m.Read(buf[:])
+	for i := 0; i < len(buf); i++ {
+		buf[i] = hexchars[buf[i]&15]
+	}
+	buf[8] = '-'
+	buf[13] = '-'
+	buf[14] = '4'
+	buf[18] = '-'
+	buf[23] = '-'
+	return string(buf[:])
+}
+
 func (m *machine) Int() int {
 	return int(m.Uint64() << 1 >> 1)
 }
@@ -1927,6 +1943,7 @@ type Rand interface {
 	Uint32() uint32
 	Float64() float64
 	Read([]byte) (n int, err error)
+	UUID() string
 }
 
 // #region -- pcg-family random number generator
