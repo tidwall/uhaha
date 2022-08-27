@@ -196,8 +196,15 @@ type Config struct {
 	// prior to send into a client connection.
 	ResponseFilter ResponseFilter
 
-	// StateChange is an optional callback function
+	// StateChange is an optional callback function that fires when the raft
+	// state has changed.
 	StateChange func(state State)
+
+	// LocalConnector is an optional callback function that returns a new
+	// connector that allows for establishing "local" connections through
+	// the Redis protocol. A local connection bypasses the network and
+	// communicates directly with this server, though the same process.
+	LocalConnector func(lconn LocalConnector)
 
 	LocalTime   bool          // default false
 	TickDelay   time.Duration // default 200ms
@@ -3257,38 +3264,46 @@ func redisConnWriteAny(
 }
 
 func redisServiceHandler(s Service, ln net.Listener) {
-	s.Log().Fatal(redcon.Serve(ln,
-		// handle commands
-		func(conn redcon.Conn, cmd redcon.Command) {
-			client := conn.Context().(*redisClient)
-			var args [][]string
+	accept := func(conn redcon.Conn) bool {
+		context, accept := s.Opened(conn.RemoteAddr())
+		if !accept {
+			return false
+		}
+		client := new(redisClient)
+		client.opts.From = client
+		client.opts.Context = context
+		conn.SetContext(client)
+		return true
+	}
+	closed := func(conn redcon.Conn, err error) {
+		if conn.Context() == nil {
+			return
+		}
+		client := conn.Context().(*redisClient)
+		s.Closed(client.opts.Context, conn.RemoteAddr())
+	}
+	handle := func(conn redcon.Conn, cmd redcon.Command) {
+		client := conn.Context().(*redisClient)
+		var args [][]string
+		args = append(args, redisCommandToArgs(cmd))
+		for _, cmd := range conn.ReadPipeline() {
 			args = append(args, redisCommandToArgs(cmd))
-			for _, cmd := range conn.ReadPipeline() {
-				args = append(args, redisCommandToArgs(cmd))
-			}
-			redisServiceExecArgs(s, client, conn, args)
-		},
-		// handle opened connection
-		func(conn redcon.Conn) bool {
-			context, accept := s.Opened(conn.RemoteAddr())
-			if !accept {
-				return false
-			}
-			client := new(redisClient)
-			client.opts.From = client
-			client.opts.Context = context
-			conn.SetContext(client)
-			return true
-		},
-		// handle closed connection
-		func(conn redcon.Conn, err error) {
-			if conn.Context() == nil {
-				return
-			}
-			client := conn.Context().(*redisClient)
-			s.Closed(client.opts.Context, conn.RemoteAddr())
-		}),
-	)
+		}
+		redisServiceExecArgs(s, client, conn, args)
+	}
+
+	if s, ok := s.(*service); ok {
+		if s.ra.conf.LocalConnector != nil {
+			s.ra.conf.LocalConnector(&localRedisConnector{
+				auth:   s.ra.conf.Auth,
+				accept: accept,
+				closed: closed,
+				handle: handle,
+			})
+		}
+	}
+
+	s.Log().Fatal(redcon.Serve(ln, handle, accept, closed))
 }
 
 // FilterArgs ...
@@ -3381,4 +3396,107 @@ func (conn *redisHijackConn) ReadCommand() (args []string, err error) {
 		return false
 	})
 	return args, err
+}
+
+type LocalConnector interface {
+	Open() (LocalConn, error)
+}
+
+type localRedisConnector struct {
+	auth   string
+	accept func(conn redcon.Conn) bool
+	closed func(conn redcon.Conn, err error)
+	handle func(conn redcon.Conn, cmd redcon.Command)
+}
+
+type LocalConn interface {
+	Do(args ...string) redcon.RESP
+	Close()
+}
+
+func (lc *localRedisConnector) Open() (LocalConn, error) {
+	conn := &localRedisConn{lc: lc}
+	conn.rc = &localRedconConn{conn: conn}
+	if !conn.lc.accept(conn.rc) {
+		return nil, errors.New("not accepted")
+	}
+	conn.Do("auth", lc.auth)
+	return conn, nil
+}
+
+type localRedisConn struct {
+	lc *localRedisConnector
+	rc *localRedconConn
+}
+
+func (conn *localRedisConn) Close() {
+	conn.lc.closed(conn.rc, nil)
+}
+
+func (conn *localRedisConn) Do(args ...string) redcon.RESP {
+	var cmd redcon.Command
+	cmd.Args = make([][]byte, len(args))
+	raw := redcon.AppendArray(nil, len(args))
+	for i := 0; i < len(args); i++ {
+		raw = redcon.AppendBulkString(raw, args[i])
+		cmd.Args[i] = []byte(args[i])
+	}
+	cmd.Raw = raw
+	conn.lc.handle(conn.rc, cmd)
+	var resp redcon.RESP
+	if len(conn.rc.out) > 0 {
+		_, resp = redcon.ReadNextRESP(conn.rc.out)
+		conn.rc.out = nil
+	}
+	return resp
+}
+
+type localRedconConn struct {
+	ctx  interface{}
+	out  []byte
+	conn *localRedisConn
+}
+
+func (c *localRedconConn) Close() error                   { return nil }
+func (c *localRedconConn) Context() interface{}           { return c.ctx }
+func (c *localRedconConn) SetContext(v interface{})       { c.ctx = v }
+func (c *localRedconConn) SetReadBuffer(n int)            {}
+func (c *localRedconConn) RemoteAddr() string             { return "" }
+func (c *localRedconConn) ReadPipeline() []redcon.Command { return nil }
+func (c *localRedconConn) PeekPipeline() []redcon.Command { return nil }
+func (c *localRedconConn) NetConn() net.Conn              { return nil }
+func (c *localRedconConn) Detach() redcon.DetachedConn    { return nil }
+
+func (c *localRedconConn) WriteString(str string) {
+	c.out = redcon.AppendString(c.out, str)
+}
+func (c *localRedconConn) WriteBulk(bulk []byte) {
+	c.out = redcon.AppendBulk(c.out, bulk)
+}
+func (c *localRedconConn) WriteBulkString(bulk string) {
+	c.out = redcon.AppendBulkString(c.out, bulk)
+}
+func (c *localRedconConn) WriteInt(num int) {
+	c.out = redcon.AppendInt(c.out, int64(num))
+}
+func (c *localRedconConn) WriteInt64(num int64) {
+	c.out = redcon.AppendInt(c.out, num)
+}
+func (c *localRedconConn) WriteUint64(num uint64) {
+	c.out = redcon.AppendUint(c.out, num)
+}
+func (c *localRedconConn) WriteError(msg string) {
+	c.out = redcon.AppendError(c.out, msg)
+}
+func (c *localRedconConn) WriteArray(count int) {
+	c.out = redcon.AppendArray(c.out, count)
+}
+func (c *localRedconConn) WriteNull() {
+	c.out = redcon.AppendNull(c.out)
+}
+func (c *localRedconConn) WriteRaw(data []byte) {
+	c.out = append(c.out, data...)
+}
+func (c *localRedconConn) WriteAny(v interface{}) {
+	c.out = redcon.AppendAny(c.out, v)
 }
