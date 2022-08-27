@@ -196,6 +196,9 @@ type Config struct {
 	// prior to send into a client connection.
 	ResponseFilter ResponseFilter
 
+	// StateChange is an optional callback function
+	StateChange func(state State)
+
 	LocalTime   bool          // default false
 	TickDelay   time.Duration // default 200ms
 	BackupPath  string        // default ""
@@ -216,6 +219,39 @@ type Config struct {
 	Advertise   string        // default ""
 	TryErrors   bool          // default false (return TRY instead of MOVED)
 	InitRunQuit bool          // default false
+}
+
+// State captures the state of a Raft node: Follower, Candidate, Leader,
+// or Shutdown.
+type State byte
+
+const (
+	// Follower is the initial state of a Raft node.
+	Follower State = iota
+
+	// Candidate is one of the valid states of a Raft node.
+	Candidate
+
+	// Leader is one of the valid states of a Raft node.
+	Leader
+
+	// Shutdown is the terminal state of a Raft node.
+	Shutdown
+)
+
+func (state State) String() string {
+	switch state {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Shutdown:
+		return "Shutdown"
+	default:
+		return "Unknown"
+	}
 }
 
 // The Backend database format used for storing Raft logs and meta data.
@@ -780,6 +816,30 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 	ra, err := raft.NewRaft(rconf, fsm, logStore, stableStore, snaps, trans)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if conf.StateChange != nil {
+		// monitor the state changes.
+		lstate := raft.Shutdown
+		conf.StateChange(Shutdown)
+		go func() {
+			for {
+				state := ra.State()
+				if state != lstate {
+					lstate = state
+					switch state {
+					case raft.Candidate:
+						conf.StateChange(Candidate)
+					case raft.Follower:
+						conf.StateChange(Follower)
+					case raft.Leader:
+						conf.StateChange(Leader)
+					case raft.Shutdown:
+						conf.StateChange(Shutdown)
+					}
+				}
+				time.Sleep(time.Second / 4)
+			}
+		}()
 	}
 	return &raftWrap{
 		Raft:      ra,
