@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -266,8 +265,8 @@ type Backend int
 
 const (
 	// LevelDB is an on-disk LSM (LSM log-structured merge-tree) database. This
-	// format is optimized for fast sequential reads and writes, which is ideal
-	// for most Raft implementations. This is the default format used by Uhaha.
+	// format is optimized for fast sequential writes, which is ideal for most
+	// Raft implementations. This is the default format used by Uhaha.
 	LevelDB Backend = iota
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
@@ -508,7 +507,7 @@ func jsonSnapshot(data interface{}) (Snapshot, error) {
 }
 
 func jsonRestore(rd io.Reader, typ reflect.Type) (interface{}, error) {
-	jsdata, err := ioutil.ReadAll(rd)
+	jsdata, err := io.ReadAll(rd)
 	if err != nil {
 		return nil, err
 	}
@@ -552,7 +551,7 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 		lopts.Level = 3
 	case "quiet", "silent":
 		lopts.Level = 3
-		wr = ioutil.Discard
+		wr = io.Discard
 	default:
 		fmt.Fprintf(os.Stderr, "invalid -loglevel: %s\n", logLevel)
 		os.Exit(1)
@@ -570,17 +569,13 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 
 func stateChangeFilter(line string, log *redlog.Logger) string {
 	if strings.Contains(line, "entering ") {
-		app := log.App()
 		if strings.Contains(line, "entering candidate state") {
-			app = 'C'
+			log.SetApp('C')
 		} else if strings.Contains(line, "entering follower state") {
-			app = 'F'
+			log.SetApp('F')
 		} else if strings.Contains(line, "entering leader state") {
-			app = 'L'
-		} else {
-			return line
+			log.SetApp('L')
 		}
-		log.SetApp(app)
 	}
 	return line
 }
@@ -2098,8 +2093,8 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 
 // BARRIER
 // help: barrier is a noop that saves to the raft log. It can be used to
-//       ensure that the current server is the leader and that the cluster
-//       is working.
+// ensure that the current server is the leader and that the cluster
+// is working.
 func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	if len(args) != 1 {
 		return nil, ErrWrongNumArgs
@@ -2109,8 +2104,8 @@ func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // TICK timestamp-int64 random-int64
 // help: updates the machine timestamp and random seed. It's not possible to
-//       directly call this from a client service. It can only be called by
-//       its own internal server instance.
+// directly call this from a client service. It can only be called by
+// its own internal server instance.
 func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 	m := getBaseMachine(um)
 	if m == nil {
@@ -2333,7 +2328,7 @@ func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string,
 
 // RAFT SNAPSHOT NOW
 // help: takes a snapshot of the data and returns information relating to the
-//       resulting snapshot; map[string]string
+// resulting snapshot; map[string]string
 func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string,
 ) (interface{}, error) {
 	if len(args) != 3 {
@@ -2447,7 +2442,7 @@ func cmdRAFTSNAPSHOTREAD(m *machine, ra *raftWrap, args []string,
 	defer f.Close()
 	var bytes []byte
 	if allBytes {
-		bytes, err = ioutil.ReadAll(f)
+		bytes, err = io.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}
@@ -2920,16 +2915,17 @@ func (s *service) Auth(auth string) error {
 // The Send function sends command args to the service and return a future
 // receiver for getting the response.
 // There are three type of commands: write, read, and system.
-// - Write commands always go though the raft log one at a time.
-// - Read commands do not go though the raft log but do need to be executed
-//   on the leader. Many reads from multiple clients can execute at the same
-//   time, but each read must wait until the leader has applied at least one
-//   new tick (which acts as a barrier) and must wait for any pending writes
-//   that the same client has issued to be fully applied before executing the
-//   read.
-// - System commands run independently from the machine or user data space, and
-//   are primarily used for executing lower level system operations such as
-//   Raft functions, backups, server stats, etc.
+//
+//   - Write commands always go though the raft log one at a time.
+//   - Read commands do not go though the raft log but do need to be executed
+//     on the leader. Many reads from multiple clients can execute at the same
+//     time, but each read must wait until the leader has applied at least one
+//     new tick (which acts as a barrier) and must wait for any pending writes
+//     that the same client has issued to be fully applied before executing the
+//     read.
+//   - System commands run independently from the machine or user data space, and
+//     are primarily used for executing lower level system operations such as
+//     Raft functions, backups, server stats, etc.
 //
 // ** Open Reads **
 // When the server has been started with the --openreads flag or when

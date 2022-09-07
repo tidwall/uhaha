@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -97,7 +96,7 @@ func startInstance(num, size int, wg *sync.WaitGroup) *instance {
 	output := os.Getenv("OUTPUT_LOGS") != ""
 	inst := &instance{num: num, size: size}
 	inst.wg.Add(1)
-	path, err := ioutil.TempDir("", "")
+	path, err := os.MkdirTemp("", "")
 	if err != nil {
 		panic(err)
 	}
@@ -144,7 +143,7 @@ func startInstance(num, size int, wg *sync.WaitGroup) *instance {
 				if output {
 					io.Copy(os.Stdout, brd)
 				} else {
-					io.Copy(ioutil.Discard, brd)
+					io.Copy(io.Discard, brd)
 				}
 				break
 			}
