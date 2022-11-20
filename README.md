@@ -249,7 +249,7 @@ Then create a cluster using the cert & key files. Along with an auth.
 ./ticket -n 2 -a 10.0.0.3:11001 --tls-cert uhaha-example.pem --tls-key uhaha-example-key.pem --auth my-secret -j 10.0.0.1:11001
 ```
 
-Finally you can connect to the server from a client that has the `rootCA.pem`. 
+Now you can connect to the server from a client that has the `rootCA.pem`. 
 You can find the location of your rootCA.pem file in the running `ls "$(mkcert -CAROOT)/rootCA.pem"`.
 
 ```sh
