@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
-	"github.com/tidwall/rhh"
+	"github.com/tidwall/hashmap"
 )
 
 const app = "6a8d5bef.app"
@@ -314,7 +314,7 @@ type basicTestCluster struct {
 	mu          sync.Mutex
 	set         int
 	deleted     int
-	keys        rhh.Map
+	keys        hashmap.Map[string, interface{}]
 }
 
 func newBasicTestCluster() *basicTestCluster {
