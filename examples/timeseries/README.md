@@ -74,7 +74,7 @@ OK
 OK
 > query cpu 0 now 1000
 1) "cpu 1598907970926047001 hello=jello"
-2) "cpu 1598907998045460001 hi-sky"
+2) "cpu 1598907998045460001 hi=sky"
 ```
 
 For other information check out the [Uhaha README](https://github.com/tidwall/uhaha).
