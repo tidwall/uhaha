@@ -34,6 +34,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/btree"
 	"github.com/tidwall/match"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
@@ -306,6 +307,8 @@ const (
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
 	Bolt
+	// Memory is an in-memory database. The data is never persisted.
+	Memory
 )
 
 func (conf *Config) def() {
@@ -409,6 +412,8 @@ func confInit(conf *Config) {
 		conf.Backend = LevelDB
 	case "bolt":
 		conf.Backend = Bolt
+	case "memory":
+		conf.Backend = Memory
 	default:
 		fmt.Fprintf(os.Stderr, "invalid --backend: '%s'\n", backend)
 	}
@@ -695,6 +700,9 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 func storeInit(conf Config, dir string, log *redlog.Logger,
 ) (raft.LogStore, raft.StableStore) {
 	switch conf.Backend {
+	case Memory:
+		store := newMemoryStore()
+		return store, store
 	case Bolt:
 		store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
 		if err != nil {
@@ -3552,4 +3560,85 @@ func (c *localRedconConn) WriteRaw(data []byte) {
 }
 func (c *localRedconConn) WriteAny(v any) {
 	c.out = redcon.AppendAny(c.out, v)
+}
+
+type memoryStore struct {
+	stable map[string]string
+	log    *btree.BTreeG[raft.Log]
+}
+
+func newMemoryStore() *memoryStore {
+	store := new(memoryStore)
+	store.log = btree.NewBTreeG(func(a, b raft.Log) bool {
+		return a.Index < b.Index
+	})
+	store.stable = make(map[string]string)
+	return store
+}
+
+func (store *memoryStore) Set(key []byte, val []byte) error {
+	store.stable[string(key)] = string(val)
+	return nil
+}
+
+func (store *memoryStore) Get(key []byte) ([]byte, error) {
+	val, ok := store.stable[string(key)]
+	if !ok {
+		return nil, nil
+	}
+	return []byte(val), nil
+}
+
+func (store *memoryStore) SetUint64(key []byte, val uint64) error {
+	return store.Set(key, []byte(strconv.FormatUint(val, 10)))
+}
+
+func (store *memoryStore) GetUint64(key []byte) (uint64, error) {
+	val, err := store.Get(key)
+	if err != nil || len(val) == 0 {
+		return 0, nil
+	}
+	return strconv.ParseUint(string(val), 10, 64)
+}
+
+func (store *memoryStore) FirstIndex() (uint64, error) {
+	log, ok := store.log.Min()
+	if !ok {
+		return 0, nil
+	}
+	return log.Index, nil
+}
+
+func (store *memoryStore) LastIndex() (uint64, error) {
+	log, ok := store.log.Max()
+	if !ok {
+		return 0, nil
+	}
+	return log.Index, nil
+}
+
+func (store *memoryStore) GetLog(index uint64, log *raft.Log) error {
+	log0, ok := store.log.Get(raft.Log{Index: index})
+	if !ok {
+		return raft.ErrLogNotFound
+	}
+	*log = log0
+	return nil
+}
+func (store *memoryStore) StoreLog(log *raft.Log) error {
+	store.log.Load(*log)
+	return nil
+}
+func (store *memoryStore) StoreLogs(logs []*raft.Log) error {
+	for _, log := range logs {
+		store.StoreLog(log)
+	}
+	return nil
+}
+func (store *memoryStore) DeleteRange(min, max uint64) error {
+	var opts btree.DeleteRangeOptions
+	opts.MaxInclusive = true
+	opts.NoReturn = true
+	store.log.DeleteRange(raft.Log{Index: min}, raft.Log{Index: max}, &opts)
+	return nil
 }
