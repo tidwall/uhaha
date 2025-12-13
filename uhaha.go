@@ -41,6 +41,8 @@ import (
 	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
+const disableSnappy = true
+
 // Main entrypoint for the cluster node. This must be called once and only
 // once, and as the last call in the Go main() function. There are no return
 // values as all application operations, logging, and I/O will be forever
@@ -1225,7 +1227,9 @@ func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
 				data = append(data, arg...)
 			}
 		}
-		data = snappy.Encode(nil, data)
+		if !disableSnappy {
+			data = snappy.Encode(nil, data)
+		}
 
 		// Apply the data and read back the messages
 		resps, err := func() ([]applyResp, error) {
@@ -1869,9 +1873,15 @@ type applyResp struct {
 }
 
 func (m *machine) Apply(l *raft.Log) interface{} {
-	packet, err := snappy.Decode(nil, l.Data)
-	if err != nil {
-		m.log.Panic(err)
+	var packet []byte
+	if !disableSnappy {
+		var err error
+		packet, err = snappy.Decode(nil, l.Data)
+		if err != nil {
+			m.log.Panic(err)
+		}
+	} else {
+		packet = l.Data
 	}
 	m.mu.Lock()
 	defer func() {
