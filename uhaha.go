@@ -35,10 +35,13 @@ import (
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/btree"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/match"
+	"github.com/tidwall/pretty"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
+	"github.com/tidwall/sjson"
 
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	raftleveldb "github.com/tidwall/raft-leveldb"
@@ -701,8 +704,12 @@ func storeInit(conf Config, dir string, log *redlog.Logger,
 ) (raft.LogStore, raft.StableStore) {
 	switch conf.Backend {
 	case Memory:
-		store := newMemoryStore()
-		return store, store
+		jsonStore, err := newJSONStableStore(filepath.Join(dir, "store"))
+		if err != nil {
+			log.Fatalf("json store open: %s", err)
+		}
+		memStore := newMemoryLogStore()
+		return memStore, jsonStore
 	case Bolt:
 		store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
 		if err != nil {
@@ -3562,46 +3569,25 @@ func (c *localRedconConn) WriteAny(v any) {
 	c.out = redcon.AppendAny(c.out, v)
 }
 
-type memoryStore struct {
-	stable map[string]string
-	log    *btree.BTreeG[raft.Log]
+type memoryLogStore struct {
+	mu  sync.Mutex
+	log *btree.BTreeG[raft.Log]
 }
 
-func newMemoryStore() *memoryStore {
-	store := new(memoryStore)
-	store.log = btree.NewBTreeG(func(a, b raft.Log) bool {
+func newMemoryLogStore() *memoryLogStore {
+	store := new(memoryLogStore)
+	store.log = btree.NewBTreeGOptions(func(a, b raft.Log) bool {
 		return a.Index < b.Index
+	}, btree.Options{
+		Degree:  256,
+		NoLocks: true,
 	})
-	store.stable = make(map[string]string)
 	return store
 }
 
-func (store *memoryStore) Set(key []byte, val []byte) error {
-	store.stable[string(key)] = string(val)
-	return nil
-}
-
-func (store *memoryStore) Get(key []byte) ([]byte, error) {
-	val, ok := store.stable[string(key)]
-	if !ok {
-		return nil, nil
-	}
-	return []byte(val), nil
-}
-
-func (store *memoryStore) SetUint64(key []byte, val uint64) error {
-	return store.Set(key, []byte(strconv.FormatUint(val, 10)))
-}
-
-func (store *memoryStore) GetUint64(key []byte) (uint64, error) {
-	val, err := store.Get(key)
-	if err != nil || len(val) == 0 {
-		return 0, nil
-	}
-	return strconv.ParseUint(string(val), 10, 64)
-}
-
-func (store *memoryStore) FirstIndex() (uint64, error) {
+func (store *memoryLogStore) FirstIndex() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	log, ok := store.log.Min()
 	if !ok {
 		return 0, nil
@@ -3609,7 +3595,9 @@ func (store *memoryStore) FirstIndex() (uint64, error) {
 	return log.Index, nil
 }
 
-func (store *memoryStore) LastIndex() (uint64, error) {
+func (store *memoryLogStore) LastIndex() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	log, ok := store.log.Max()
 	if !ok {
 		return 0, nil
@@ -3617,7 +3605,9 @@ func (store *memoryStore) LastIndex() (uint64, error) {
 	return log.Index, nil
 }
 
-func (store *memoryStore) GetLog(index uint64, log *raft.Log) error {
+func (store *memoryLogStore) GetLog(index uint64, log *raft.Log) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	log0, ok := store.log.Get(raft.Log{Index: index})
 	if !ok {
 		return raft.ErrLogNotFound
@@ -3625,20 +3615,81 @@ func (store *memoryStore) GetLog(index uint64, log *raft.Log) error {
 	*log = log0
 	return nil
 }
-func (store *memoryStore) StoreLog(log *raft.Log) error {
+func (store *memoryLogStore) StoreLog(log *raft.Log) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	store.log.Load(*log)
 	return nil
 }
-func (store *memoryStore) StoreLogs(logs []*raft.Log) error {
+func (store *memoryLogStore) StoreLogs(logs []*raft.Log) error {
 	for _, log := range logs {
 		store.StoreLog(log)
 	}
 	return nil
 }
-func (store *memoryStore) DeleteRange(min, max uint64) error {
+func (store *memoryLogStore) DeleteRange(min, max uint64) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	var opts btree.DeleteRangeOptions
 	opts.MaxInclusive = true
 	opts.NoReturn = true
 	store.log.DeleteRange(raft.Log{Index: min}, raft.Log{Index: max}, &opts)
 	return nil
+}
+
+type jsonStableStore struct {
+	mu   sync.Mutex
+	json string
+	path string
+}
+
+func newJSONStableStore(path string) (*jsonStableStore, error) {
+	store := new(jsonStableStore)
+	store.path = path
+	data, err := os.ReadFile(filepath.Join(store.path, "stable.json"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	store.json = string(data)
+	return store, nil
+}
+
+func (store *jsonStableStore) Set(key []byte, val []byte) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var err error
+	store.json, err = sjson.Set(store.json, string(key), string(val))
+	if err != nil {
+		return err
+	}
+	store.json = string(pretty.Pretty([]byte(store.json)))
+	err = os.MkdirAll(filepath.Join(store.path), 0700)
+	if err != nil {
+		return err
+	}
+	err = os.WriteFile(filepath.Join(store.path, "stable.json-work"),
+		[]byte(store.json), 0600)
+	if err != nil {
+		return err
+	}
+	return os.Rename(filepath.Join(store.path, "stable.json-work"),
+		filepath.Join(store.path, "stable.json"))
+}
+
+func (store *jsonStableStore) Get(key []byte) ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return []byte(gjson.Get(store.json, string(key)).String()), nil
+}
+
+func (store *jsonStableStore) SetUint64(key []byte, val uint64) error {
+	return store.Set(key, []byte(strconv.FormatUint(val, 10)))
+}
+
+func (store *jsonStableStore) GetUint64(key []byte) (uint64, error) {
+	val, err := store.Get(key)
+	if err != nil || len(val) == 0 {
+		return 0, nil
+	}
+	return strconv.ParseUint(string(val), 10, 64)
 }
