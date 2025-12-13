@@ -6,6 +6,7 @@ package uhaha
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha1"
@@ -28,10 +29,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/snappy"
 	"github.com/gomodule/redigo/redis"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	"github.com/klauspost/compress/snappy"
+	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/match"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
@@ -60,6 +62,7 @@ func Main(conf Config) {
 	snaps := snapshotInit(conf, dir, m, hclogger, log)
 	ra := raftInit(conf, hclogger, m, lstore, sstore, snaps, trans, log)
 
+	printExtraLogInfo(conf, log)
 	joinClusterIfNeeded(conf, ra, addr, tlscfg, log)
 	startUserServices(conf, svr, m, ra, log)
 
@@ -226,6 +229,37 @@ type Config struct {
 	TryErrors     bool          // default false (return TRY instead of MOVED)
 	InitRunQuit   bool          // default false
 	MaxApplyBatch int           // default 256
+	Compressor    Compressor    // default Zstandard
+}
+
+// Compressor is the raft stream byte compressor
+type Compressor string
+
+const (
+	Zstandard Compressor = "ZSTD" // Zstandard
+	Snappy    Compressor = "SNAP" // Snappy
+	Raw       Compressor = "RAW0" // No compression
+)
+
+func (compressor Compressor) String() string {
+	switch compressor {
+	case Zstandard:
+		return "Zstandard"
+	case Snappy:
+		return "Snappy"
+	case Raw:
+		return "Raw"
+	default:
+		return "Unknown"
+	}
+}
+
+func (compressor Compressor) known() bool {
+	switch compressor {
+	case Zstandard, Snappy, Raw:
+		return true
+	}
+	return false
 }
 
 // State captures the state of a Raft node: Follower, Candidate, Leader,
@@ -304,6 +338,9 @@ func (conf *Config) def() {
 	}
 	if conf.MaxApplyBatch <= 0 {
 		conf.MaxApplyBatch = 256
+	}
+	if !conf.Compressor.known() {
+		conf.Compressor = Zstandard
 	}
 }
 
@@ -762,6 +799,10 @@ func (rt *remoteTime) Now() time.Time {
 	return ctime
 }
 
+func printExtraLogInfo(conf Config, log *redlog.Logger) {
+	log.Debugf("using compressor: %s", conf.Compressor)
+}
+
 // remoteTimeInit initializes the remote time fetching services, and
 // continueously runs it in the background to keep synchronized.
 func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
@@ -1188,6 +1229,34 @@ func appendUvarint(dst []byte, x uint64) []byte {
 	return append(dst, buf[:n]...)
 }
 
+func autoDecode(data []byte) ([]byte, error) {
+	if bytes.HasPrefix(data, []byte("ZSTD")) {
+		return zstd.DecodeTo(nil, data[4:])
+	} else if bytes.HasPrefix(data, []byte("RAW0")) {
+		return data[4:], nil
+	} else if bytes.HasPrefix(data, []byte("SNAP")) {
+		data = data[4:]
+	}
+	// fallback to snappy as this was the default prior to magic numbers
+	return snappy.Decode(nil, data)
+}
+
+func autoEncode(compressor Compressor, data []byte) []byte {
+	var out []byte
+	out = append(out, compressor...)
+	switch compressor {
+	case "ZSTD":
+		out = append(out, zstd.EncodeTo(nil, data)...)
+	case "RAW0":
+		out = append(out, data...)
+	case "SNAP":
+		out = append(out, snappy.Encode(nil, data)...)
+	default:
+		panic("invalid compressor '" + compressor + "'")
+	}
+	return out
+}
+
 // runWriteApplier is a background routine that handles all write requests.
 // It's job is to apply the request to the Raft log and returns the result to
 // writeRequest.
@@ -1225,7 +1294,8 @@ func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
 				data = append(data, arg...)
 			}
 		}
-		data = snappy.Encode(nil, data)
+
+		data = autoEncode(conf.Compressor, data)
 
 		// Apply the data and read back the messages
 		resps, err := func() ([]applyResp, error) {
@@ -1869,7 +1939,7 @@ type applyResp struct {
 }
 
 func (m *machine) Apply(l *raft.Log) any {
-	packet, err := snappy.Decode(nil, l.Data)
+	packet, err := autoDecode(l.Data)
 	if err != nil {
 		m.log.Panic(err)
 	}

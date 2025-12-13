@@ -5,11 +5,11 @@ go 1.24.0
 toolchain go1.24.4
 
 require (
-	github.com/golang/snappy v1.0.0
 	github.com/gomodule/redigo v1.9.3
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	github.com/klauspost/compress v1.18.2
 	github.com/tidwall/btree v1.8.1
 	github.com/tidwall/hashmap v1.8.1
 	github.com/tidwall/match v1.2.0
@@ -24,6 +24,7 @@ require (
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-metrics v0.5.4 // indirect
 	github.com/hashicorp/go-msgpack/v2 v2.1.5 // indirect
