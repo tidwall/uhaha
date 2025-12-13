@@ -700,7 +700,7 @@ func machineInit(conf Config, dir string, rdata *restoreData,
 	m.vers = versline(conf)
 	m.tickedSig = sync.NewCond(&m.mu)
 	m.created = time.Now().UnixNano()
-	m.wrC = make(chan *writeRequestFuture, 1024)
+	m.wrC = make(chan *writeRequestFuture)
 	m.tickDelay = conf.TickDelay
 	m.openReads = conf.OpenReads
 	if rdata != nil {
