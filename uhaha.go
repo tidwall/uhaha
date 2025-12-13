@@ -205,26 +205,27 @@ type Config struct {
 	// communicates directly with this server, though the same process.
 	LocalConnector func(lconn LocalConnector)
 
-	LocalTime   bool          // default false
-	TickDelay   time.Duration // default 200ms
-	BackupPath  string        // default ""
-	InitialData interface{}   // default nil
-	NodeID      string        // default "1"
-	Addr        string        // default ":11001"
-	DataDir     string        // default "data"
-	LogOutput   io.Writer     // default os.Stderr
-	LogLevel    string        // default "notice"
-	JoinAddr    string        // default ""
-	Backend     Backend       // default LevelDB
-	NoSync      bool          // default false
-	OpenReads   bool          // default false
-	MaxPool     int           // default 8
-	TLSCertPath string        // default ""
-	TLSKeyPath  string        // default ""
-	Auth        string        // default ""
-	Advertise   string        // default ""
-	TryErrors   bool          // default false (return TRY instead of MOVED)
-	InitRunQuit bool          // default false
+	LocalTime     bool          // default false
+	TickDelay     time.Duration // default 200ms
+	BackupPath    string        // default ""
+	InitialData   interface{}   // default nil
+	NodeID        string        // default "1"
+	Addr          string        // default ":11001"
+	DataDir       string        // default "data"
+	LogOutput     io.Writer     // default os.Stderr
+	LogLevel      string        // default "notice"
+	JoinAddr      string        // default ""
+	Backend       Backend       // default LevelDB
+	NoSync        bool          // default false
+	OpenReads     bool          // default false
+	MaxPool       int           // default 8
+	TLSCertPath   string        // default ""
+	TLSKeyPath    string        // default ""
+	Auth          string        // default ""
+	Advertise     string        // default ""
+	TryErrors     bool          // default false (return TRY instead of MOVED)
+	InitRunQuit   bool          // default false
+	MaxApplyBatch int           // default 256
 }
 
 // State captures the state of a Raft node: Follower, Candidate, Leader,
@@ -295,11 +296,14 @@ func (conf *Config) def() {
 	if conf.LogOutput == nil {
 		conf.LogOutput = os.Stderr
 	}
-	if conf.TickDelay == 0 {
+	if conf.TickDelay <= 0 {
 		conf.TickDelay = time.Millisecond * 200
 	}
-	if conf.MaxPool == 0 {
+	if conf.MaxPool <= 0 {
 		conf.MaxPool = 8
+	}
+	if conf.MaxApplyBatch <= 0 {
+		conf.MaxApplyBatch = 256
 	}
 }
 
@@ -1188,7 +1192,7 @@ func appendUvarint(dst []byte, x uint64) []byte {
 // It's job is to apply the request to the Raft log and returns the result to
 // writeRequest.
 func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
-	var maxReqs = 256 // TODO: make configurable
+	var maxReqs = conf.MaxApplyBatch
 	for {
 		// Gather up as many requests (up to 256) into a single list.
 		var reqs []*writeRequestFuture
