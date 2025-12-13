@@ -21,12 +21,12 @@ import (
 
 const app = "6a8d5bef.app"
 
-func wlog(format string, args ...interface{}) {
+func wlog(format string, args ...any) {
 	line := strings.TrimSpace(fmt.Sprintf(format, args...))
 	fmt.Printf("%s\n", line)
 }
 
-func must(v interface{}, err error) interface{} {
+func must(v any, err error) any {
 	if err != nil {
 		panic(err.Error())
 	}
@@ -248,7 +248,7 @@ func OpenTestConn(size int) *TestConn {
 	return c
 }
 
-func (c *TestConn) Do(cmd string, args ...interface{}) interface{} {
+func (c *TestConn) Do(cmd string, args ...any) any {
 	start := time.Now()
 	for {
 		reply, err := c.conn.Do(cmd, args...)
@@ -314,7 +314,7 @@ type basicTestCluster struct {
 	mu          sync.Mutex
 	set         int
 	deleted     int
-	keys        hashmap.Map[string, interface{}]
+	keys        hashmap.Map[string, any]
 }
 
 func newBasicTestCluster() *basicTestCluster {

@@ -146,12 +146,12 @@ type Config struct {
 	}
 
 	// Snapshot fires when a snapshot
-	Snapshot func(data interface{}) (Snapshot, error)
+	Snapshot func(data any) (Snapshot, error)
 
 	// Restore returns a data object that is fully restored from the previous
 	// snapshot using the input Reader. A restore operation on happens once,
 	// if needed, at the start of the application.
-	Restore func(rd io.Reader) (data interface{}, err error)
+	Restore func(rd io.Reader) (data any, err error)
 
 	// UseJSONSnapshots is a convienence field that tells the machine to use
 	// JSON as the format for all snapshots and restores. This may be good for
@@ -185,11 +185,11 @@ type Config struct {
 	// network connection was opened on this machine. You can accept or deny
 	// the connection, and optionally provide a client-specific context that
 	// stick around until the connection is closed with ConnClosed.
-	ConnOpened func(addr string) (context interface{}, accept bool)
+	ConnOpened func(addr string) (context any, accept bool)
 
 	// ConnClosed is an optional callback function that fires when a network
 	// connection has been closed on this machine.
-	ConnClosed func(context interface{}, addr string)
+	ConnClosed func(context any, addr string)
 
 	// ResponseFilter is and options function used to filter every response
 	// prior to send into a client connection.
@@ -208,7 +208,7 @@ type Config struct {
 	LocalTime     bool          // default false
 	TickDelay     time.Duration // default 200ms
 	BackupPath    string        // default ""
-	InitialData   interface{}   // default nil
+	InitialData   any           // default nil
 	NodeID        string        // default "1"
 	Addr          string        // default ":11001"
 	DataDir       string        // default "data"
@@ -435,14 +435,14 @@ func confInit(conf *Config) {
 }
 
 func (conf *Config) addCommand(kind byte, name string,
-	fn func(m Machine, args []string) (interface{}, error),
+	fn func(m Machine, args []string) (any, error),
 ) {
 	name = strings.ToLower(name)
 	if conf.cmds == nil {
 		conf.cmds = make(map[string]command)
 	}
 	conf.cmds[name] = command{kind, func(m Machine, ra *raftWrap,
-		args []string) (interface{}, error) {
+		args []string) (any, error) {
 		return fn(m, args)
 	}}
 }
@@ -451,10 +451,10 @@ func (conf *Config) addCommand(kind byte, name string,
 // input that was not previously defined with AddIntermediateCommand,
 // AddWriteCommand, or AddReadCommand.
 func (conf *Config) AddCatchallCommand(
-	fn func(m Machine, args []string) (interface{}, error),
+	fn func(m Machine, args []string) (any, error),
 ) {
-	conf.catchall = command{'s', func(m Machine, ra *raftWrap,
-		args []string) (interface{}, error) {
+	conf.catchall = command{'s', func(m Machine, ra *raftWrap, args []string,
+	) (any, error) {
 		return fn(m, args)
 	}}
 }
@@ -463,21 +463,21 @@ func (conf *Config) AddCatchallCommand(
 // specific operations. It *is not* intended for working with the machine data,
 // and doing so will risk data corruption.
 func (conf *Config) AddIntermediateCommand(name string,
-	fn func(m Machine, args []string) (interface{}, error),
+	fn func(m Machine, args []string) (any, error),
 ) {
 	conf.addCommand('s', name, fn)
 }
 
 // AddReadCommand adds a command for reading machine data.
 func (conf *Config) AddReadCommand(name string,
-	fn func(m Machine, args []string) (interface{}, error),
+	fn func(m Machine, args []string) (any, error),
 ) {
 	conf.addCommand('r', name, fn)
 }
 
 // AddWriteCommand adds a command for reading or altering machine data.
 func (conf *Config) AddWriteCommand(name string,
-	fn func(m Machine, args []string) (interface{}, error),
+	fn func(m Machine, args []string) (any, error),
 ) {
 	conf.addCommand('w', name, fn)
 }
@@ -499,7 +499,7 @@ func (s *jsonSnapshotType) Persist(wr io.Writer) error {
 	_, err := wr.Write(s.jsdata)
 	return err
 }
-func jsonSnapshot(data interface{}) (Snapshot, error) {
+func jsonSnapshot(data any) (Snapshot, error) {
 	if data == nil {
 		return &jsonSnapshotType{}, nil
 	}
@@ -510,7 +510,7 @@ func jsonSnapshot(data interface{}) (Snapshot, error) {
 	return &jsonSnapshotType{jsdata: jsdata}, nil
 }
 
-func jsonRestore(rd io.Reader, typ reflect.Type) (interface{}, error) {
+func jsonRestore(rd io.Reader, typ reflect.Type) (any, error) {
 	jsdata, err := io.ReadAll(rd)
 	if err != nil {
 		return nil, err
@@ -585,7 +585,7 @@ func stateChangeFilter(line string, log *redlog.Logger) string {
 }
 
 type restoreData struct {
-	data  interface{}
+	data  any
 	ts    int64
 	seed  int64
 	start int64
@@ -643,7 +643,7 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 			return nil, err
 		}
 	} else if conf.jsonSnaps {
-		rdata.data, err = func(rd io.Reader) (data interface{}, err error) {
+		rdata.data, err = func(rd io.Reader) (data any, err error) {
 			return jsonRestore(rd, conf.jsonType)
 		}(gr)
 		if err != nil {
@@ -1674,7 +1674,7 @@ func (m *machine) Restore(rc io.ReadCloser) error {
 	restore := m.restore
 	if restore == nil {
 		if m.jsonSnaps {
-			restore = func(rd io.Reader) (data interface{}, err error) {
+			restore = func(rd io.Reader) (data any, err error) {
 				return jsonRestore(rd, m.jsonType)
 			}
 		} else {
@@ -1696,7 +1696,7 @@ func (m *machine) Restore(rc io.ReadCloser) error {
 	return err
 }
 
-func (m *machine) Context() interface{} {
+func (m *machine) Context() any {
 	return nil
 }
 
@@ -1775,7 +1775,7 @@ var ErrNotLeader = raft.ErrNotLeader
 
 type command struct {
 	kind byte // 's' system, 'r' read, 'w' write
-	fn   func(m Machine, ra *raftWrap, args []string) (interface{}, error)
+	fn   func(m Machine, ra *raftWrap, args []string) (any, error)
 }
 
 // The Machine interface is passed to every command. It includes the user data
@@ -1799,7 +1799,7 @@ type Machine interface {
 	// Read commands.
 	// For Intermediate commands, it's not safe to read or write data from
 	// this interface and you should use at your own risk.
-	Data() interface{}
+	Data() any
 	// Now generates a stable timestamp that is synced with internet time
 	// and for Write commands is always monotonical increasing. It's made to
 	// be a trusted source of time for performing operations on the user data.
@@ -1820,14 +1820,14 @@ type Machine interface {
 	// Config.ConnOpened callback.
 	// Only available for Intermediate and Read commands.
 	// Returns nil for Write Commands.
-	Context() interface{}
+	Context() any
 }
 
 type machine struct {
-	snapshot   func(data interface{}) (Snapshot, error)
-	restore    func(rd io.Reader) (data interface{}, err error)
-	connOpened func(addr string) (context interface{}, accept bool)
-	connClosed func(context interface{}, addr string)
+	snapshot   func(data any) (Snapshot, error)
+	restore    func(rd io.Reader) (data any, err error)
+	connOpened func(addr string) (context any, accept bool)
+	connClosed func(context any, addr string)
 	jsonSnaps  bool               //
 	jsonType   reflect.Type       //
 	snaps      raft.SnapshotStore //
@@ -1855,7 +1855,7 @@ type machine struct {
 	start        int64        // !! PERSISTED !! first non-zero timestamp
 	ts           int64        // !! PERSISTED !! current timestamp
 	seed         int64        // !! PERSISTED !! current seed
-	data         interface{}  // !! PERSISTED !! user data
+	data         any          // !! PERSISTED !! user data
 
 	wrC chan *writeRequestFuture
 }
@@ -1863,12 +1863,12 @@ type machine struct {
 var _ Machine = &machine{}
 
 type applyResp struct {
-	resp interface{}
+	resp any
 	elap time.Duration
 	err  error
 }
 
-func (m *machine) Apply(l *raft.Log) interface{} {
+func (m *machine) Apply(l *raft.Log) any {
 	packet, err := snappy.Decode(nil, l.Data)
 	if err != nil {
 		m.log.Panic(err)
@@ -1932,7 +1932,7 @@ func (m *machine) Apply(l *raft.Log) interface{} {
 	return resps
 }
 
-func (m *machine) Data() interface{} {
+func (m *machine) Data() any {
 	return m.data
 }
 
@@ -2038,7 +2038,7 @@ func (m *machine) Now() time.Time {
 // contextMachine wraps the machine in a connection context.
 type contextMachine struct {
 	reader  bool
-	context interface{}
+	context any
 	m       *machine
 }
 
@@ -2056,9 +2056,9 @@ func (m contextMachine) Rand() Rand {
 	}
 	return nil
 }
-func (m contextMachine) Context() interface{} { return m.context }
-func (m contextMachine) Log() Logger          { return m.m.Log() }
-func (m contextMachine) Data() interface{}    { return m.m.Data() }
+func (m contextMachine) Context() any { return m.context }
+func (m contextMachine) Log() Logger  { return m.m.Log() }
+func (m contextMachine) Data() any    { return m.m.Data() }
 
 func getBaseMachine(m Machine) *machine {
 	switch m := m.(type) {
@@ -2099,7 +2099,7 @@ func WriteRawMachineInfo(m Machine, info *RawMachineInfo) {
 // help: barrier is a noop that saves to the raft log. It can be used to
 // ensure that the current server is the leader and that the cluster
 // is working.
-func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdBARRIER(um Machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 1 {
 		return nil, ErrWrongNumArgs
 	}
@@ -2110,7 +2110,7 @@ func cmdBARRIER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 // help: updates the machine timestamp and random seed. It's not possible to
 // directly call this from a client service. It can only be called by
 // its own internal server instance.
-func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdTICK(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2148,7 +2148,7 @@ func cmdTICK(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // CLUSTER subcommand args...
 // help: calls a system-level cluster operation.
-func cmdCLUSTER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdCLUSTER(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2166,7 +2166,7 @@ func cmdCLUSTER(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // RAFT subcommand args...
 // help: calls a system-level raft operation.
-func cmdRAFT(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdRAFT(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2184,8 +2184,7 @@ func cmdRAFT(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // RAFT LEADER
 // help: returns the current leader; string
-func cmdRAFTLEADER(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTLEADER(um Machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2193,8 +2192,7 @@ func cmdRAFTLEADER(um Machine, ra *raftWrap, args []string,
 }
 
 // RAFT SERVER subcommand args...
-func cmdRAFTSERVER(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSERVER(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2217,8 +2215,7 @@ func cmdRAFTSERVER(um Machine, ra *raftWrap, args []string,
 
 // RAFT SERVER LIST
 // help: returns a list of the servers in the cluster
-func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2239,8 +2236,7 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string,
 
 // RAFT SERVER REMOVE id
 // help: removes a server from the cluster; bool
-func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 4 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2254,8 +2250,7 @@ func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string,
 
 // RAFT SERVER ADD id address
 // help: Returns true if server added, or error; bool
-func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 5 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2269,8 +2264,7 @@ func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string,
 
 // RAFT INFO [pattern]
 // help: returns various raft related info; map[string]string
-func cmdRAFTINFO(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTINFO(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2306,8 +2300,7 @@ func cmdRAFTINFO(um Machine, ra *raftWrap, args []string,
 }
 
 // RAFT SNAPSHOT subcommand args...
-func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2333,8 +2326,7 @@ func cmdRAFTSNAPSHOT(um Machine, ra *raftWrap, args []string,
 // RAFT SNAPSHOT NOW
 // help: takes a snapshot of the data and returns information relating to the
 // resulting snapshot; map[string]string
-func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2372,8 +2364,7 @@ func cmdRAFTSNAPSHOTNOW(m *machine, ra *raftWrap, args []string,
 
 // RAFT SNAPSHOT LIST
 // help: returns a list of the current snapshots on disk. []map[string]string
-func cmdRAFTSNAPSHOTLIST(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSNAPSHOTLIST(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 3 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2395,8 +2386,7 @@ func cmdRAFTSNAPSHOTLIST(m *machine, ra *raftWrap, args []string,
 
 // RAFT SNAPSHOT FILE id
 // help: returns the path to the snapshot file; string
-func cmdRAFTSNAPSHOTFILE(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSNAPSHOTFILE(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 4 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2410,8 +2400,7 @@ func cmdRAFTSNAPSHOTFILE(m *machine, ra *raftWrap, args []string,
 
 // RAFT SNAPSHOT READ id [RANGE offset limit]
 // help: reads the contents of a snapshot file; []byte
-func cmdRAFTSNAPSHOTREAD(m *machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTSNAPSHOTREAD(m *machine, ra *raftWrap, args []string) (any, error) {
 	var id string
 	var offset, limit int64
 	var allBytes bool
@@ -2506,8 +2495,7 @@ var clusterCommands = map[string]command{
 
 // CLUSTER HELP
 // help: returns the valid RAFT related commands; []string
-func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2521,8 +2509,7 @@ func cmdCLUSTERHELP(um Machine, ra *raftWrap, args []string,
 
 // CLUSTER INFO
 // help: returns various redis cluster info; string
-func cmdCLUSTERINFO(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdCLUSTERINFO(um Machine, ra *raftWrap, args []string) (any, error) {
 	slist, err := ra.getServerList()
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
@@ -2548,8 +2535,7 @@ func cmdCLUSTERINFO(um Machine, ra *raftWrap, args []string,
 // CLUSTER SLOTS
 // help: returns the cluster slots, which is always all slots being assigned
 // to the leader.
-func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string) (any, error) {
 	slist, err := ra.getServerList()
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
@@ -2564,11 +2550,11 @@ func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
 	if !leader.leader {
 		return nil, errors.New("CLUSTERDOWN The cluster is down")
 	}
-	return []interface{}{
-		[]interface{}{
+	return []any{
+		[]any{
 			redcon.SimpleInt(0),
 			redcon.SimpleInt(16383),
-			[]interface{}{
+			[]any{
 				leader.host(),
 				redcon.SimpleInt(leader.port()),
 				leader.clusterID(),
@@ -2579,8 +2565,7 @@ func cmdCLUSTERSLOTS(um Machine, ra *raftWrap, args []string,
 
 // CLUSTER NODES
 // help: returns the cluster nodes
-func cmdCLUSTERNODES(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdCLUSTERNODES(um Machine, ra *raftWrap, args []string) (any, error) {
 	slist, err := ra.getServerList()
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
@@ -2623,8 +2608,7 @@ var raftCommands = map[string]command{
 
 // RAFT HELP
 // help: returns the valid RAFT related commands; []string
-func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
-) (interface{}, error) {
+func cmdRAFTHELP(um Machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 2 {
 		return nil, errWrongNumArgsRaft
 	}
@@ -2645,7 +2629,7 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string,
 }
 
 // VERSION
-func cmdVERSION(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdVERSION(um Machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 1 {
 		return nil, ErrWrongNumArgs
 	}
@@ -2653,7 +2637,7 @@ func cmdVERSION(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 }
 
 // MACHINE [HUMAN]
-func cmdMACHINE(um Machine, ra *raftWrap, args []string) (interface{}, error) {
+func cmdMACHINE(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
@@ -2690,30 +2674,30 @@ func cmdMACHINE(um Machine, ra *raftWrap, args []string) (interface{}, error) {
 
 // Logger is the logger used by Uhaha for printing all console messages.
 type Logger interface {
-	Debugf(format string, args ...interface{})
-	Debug(args ...interface{})
-	Debugln(args ...interface{})
-	Verbf(format string, args ...interface{})
-	Verb(args ...interface{})
-	Verbln(args ...interface{})
-	Noticef(format string, args ...interface{})
-	Notice(args ...interface{})
-	Noticeln(args ...interface{})
-	Printf(format string, args ...interface{})
-	Print(args ...interface{})
-	Println(args ...interface{})
-	Warningf(format string, args ...interface{})
-	Warning(args ...interface{})
-	Warningln(args ...interface{})
-	Fatalf(format string, args ...interface{})
-	Fatal(args ...interface{})
-	Fatalln(args ...interface{})
-	Panicf(format string, args ...interface{})
-	Panic(args ...interface{})
-	Panicln(args ...interface{})
-	Errorf(format string, args ...interface{})
-	Error(args ...interface{})
-	Errorln(args ...interface{})
+	Debugf(format string, args ...any)
+	Debug(args ...any)
+	Debugln(args ...any)
+	Verbf(format string, args ...any)
+	Verb(args ...any)
+	Verbln(args ...any)
+	Noticef(format string, args ...any)
+	Notice(args ...any)
+	Noticeln(args ...any)
+	Printf(format string, args ...any)
+	Print(args ...any)
+	Println(args ...any)
+	Warningf(format string, args ...any)
+	Warning(args ...any)
+	Warningln(args ...any)
+	Fatalf(format string, args ...any)
+	Fatal(args ...any)
+	Fatalln(args ...any)
+	Panicf(format string, args ...any)
+	Panic(args ...any)
+	Panicln(args ...any)
+	Errorf(format string, args ...any)
+	Error(args ...any)
+	Errorln(args ...any)
 }
 
 // ErrWrongNumArgs is returned when the arg count is wrong
@@ -2734,13 +2718,13 @@ var ErrCorrupt = errors.New("corrupt")
 // Receiver ...
 type Receiver interface {
 	Args() []string
-	Recv() (interface{}, time.Duration, error)
+	Recv() (any, time.Duration, error)
 }
 
 // SendOptions ...
 type SendOptions struct {
-	Context        interface{}
-	From           interface{}
+	Context        any
+	From           any
 	AllowOpenReads bool
 	DenyOpenReads  bool
 }
@@ -2778,7 +2762,7 @@ type Message struct {
 	// Args are the original command arguments.
 	Args []string
 	// Resp is the command reponse, if not an error.
-	Resp interface{}
+	Resp any
 	// Err is the command error, if not successful.
 	Err error
 	// Elapsed is the amount of time that the command took to process.
@@ -2838,9 +2822,9 @@ func (m *monitor) NewObserver() Observer {
 }
 
 type ResponseFilter func(
-	serviceName string, context interface{},
-	args []string, v interface{},
-) interface{}
+	serviceName string, context any,
+	args []string, v any,
+) any
 
 // Service is a client facing service.
 type Service interface {
@@ -2855,9 +2839,9 @@ type Service interface {
 	// Monitor returns a service monitor for observing client commands.
 	Monitor() Monitor
 	// Opened
-	Opened(addr string) (context interface{}, accept bool)
+	Opened(addr string) (context any, accept bool)
 	// Closed
-	Closed(context interface{}, addr string)
+	Closed(context any, addr string)
 	// ResponseFilter
 	ResponseFilter() ResponseFilter
 }
@@ -2877,7 +2861,7 @@ type service struct {
 	rfilt ResponseFilter
 
 	writeMu sync.Mutex
-	write   map[interface{}]*writeRequestFuture
+	write   map[any]*writeRequestFuture
 }
 
 var _ Service = &service{}
@@ -2886,7 +2870,7 @@ func newService(m *machine, ra *raftWrap, auth, name string,
 	rfilt ResponseFilter,
 ) *service {
 	s := &service{m: m, ra: ra, auth: auth, name: name, rfilt: rfilt}
-	s.write = make(map[interface{}]*writeRequestFuture)
+	s.write = make(map[any]*writeRequestFuture)
 	s.mon = newMonitor(s)
 	return s
 }
@@ -2984,21 +2968,21 @@ func (s *service) Send(args []string, opts *SendOptions) Receiver {
 	}
 }
 
-func (s *service) Opened(addr string) (context interface{}, accept bool) {
+func (s *service) Opened(addr string) (context any, accept bool) {
 	if s.m.connOpened != nil {
 		return s.m.connOpened(addr)
 	}
 	return nil, true
 }
 
-func (s *service) Closed(context interface{}, addr string) {
+func (s *service) Closed(context any, addr string) {
 	if s.m.connClosed != nil {
 		s.m.connClosed(context, addr)
 	}
 }
 
 func (s *service) execRead(cmd command, args []string, opts *SendOptions,
-) (interface{}, error) {
+) (any, error) {
 	openReads := s.m.openReads
 	if opts.AllowOpenReads {
 		if opts.DenyOpenReads {
@@ -3008,7 +2992,7 @@ func (s *service) execRead(cmd command, args []string, opts *SendOptions,
 	} else if opts.DenyOpenReads {
 		openReads = false
 	}
-	var resp interface{}
+	var resp any
 	var err error
 	if openReads {
 		resp, err = s.execOpenRead(cmd, args, opts)
@@ -3019,7 +3003,7 @@ func (s *service) execRead(cmd command, args []string, opts *SendOptions,
 }
 
 func (s *service) execOpenRead(cmd command, args []string, opts *SendOptions,
-) (interface{}, error) {
+) (any, error) {
 	// open reads can be performed on the leaders and followers that have a log
 	// which is reasonably loaded.
 	if atomic.LoadInt32(&s.m.logLoaded) == 0 {
@@ -3038,7 +3022,7 @@ func (s *service) execOpenRead(cmd command, args []string, opts *SendOptions,
 }
 
 func (s *service) execNonOpenRead(cmd command, args []string, opts *SendOptions,
-) (interface{}, error) {
+) (any, error) {
 	// Non-open reads can only be performed on a leader that has received
 	// a tick response. In this case a tick acts as a write barrier ensuring
 	// that any read command will always follow the tick.
@@ -3057,13 +3041,13 @@ func (s *service) execNonOpenRead(cmd command, args []string, opts *SendOptions,
 	return cmd.fn(m, s.ra, args)
 }
 
-func (s *service) addWrite(from interface{}, r *writeRequestFuture) {
+func (s *service) addWrite(from any, r *writeRequestFuture) {
 	s.writeMu.Lock()
 	s.write[from] = r
 	s.writeMu.Unlock()
 }
 
-func (s *service) waitWrite(from interface{}) {
+func (s *service) waitWrite(from any) {
 	s.writeMu.Lock()
 	r := s.write[from]
 	s.writeMu.Unlock()
@@ -3074,12 +3058,12 @@ func (s *service) waitWrite(from interface{}) {
 
 type simpleResponse struct {
 	args []string
-	v    interface{}
+	v    any
 	elap time.Duration
 	err  error
 }
 
-func (r *simpleResponse) Recv() (interface{}, time.Duration, error) {
+func (r *simpleResponse) Recv() (any, time.Duration, error) {
 	return r.v, r.elap, r.err
 }
 
@@ -3088,8 +3072,7 @@ func (r *simpleResponse) Args() []string {
 }
 
 // Response ...
-func Response(args []string, v interface{}, elapsed time.Duration, err error,
-) Receiver {
+func Response(args []string, v any, elapsed time.Duration, err error) Receiver {
 	return &simpleResponse{args, v, elapsed, err}
 }
 
@@ -3100,12 +3083,12 @@ func Response(args []string, v interface{}, elapsed time.Duration, err error,
 // `wg.Done` is called.
 type writeRequestFuture struct {
 	args []string
-	resp interface{}
+	resp any
 	err  error
 	elap time.Duration
 	wg   sync.WaitGroup
 	s    *service
-	from interface{}
+	from any
 }
 
 func (r *writeRequestFuture) Args() []string {
@@ -3114,7 +3097,7 @@ func (r *writeRequestFuture) Args() []string {
 
 // Recv received the response and time elapsed to process the write. Or, it
 // returns an error.
-func (r *writeRequestFuture) Recv() (interface{}, time.Duration, error) {
+func (r *writeRequestFuture) Recv() (any, time.Duration, error) {
 	r.wg.Wait()
 	r.s.writeMu.Lock()
 	if r.s.write[r.from] == r {
@@ -3255,7 +3238,7 @@ func redisConnWriteAny(
 	conn redcon.Conn,
 	client *redisClient,
 	args []string,
-	v interface{},
+	v any,
 ) {
 	if rfilt != nil {
 		v = rfilt(sname, client.opts.Context, args, v)
@@ -3330,7 +3313,7 @@ type HijackedConn interface {
 	ReadCommand() (args []string, err error)
 	// WriteAny writes any type to the write buffer using the format rules that
 	// are defined by the original Service.
-	WriteAny(v interface{})
+	WriteAny(v any)
 	// WriteRaw writes raw data to the write buffer.
 	WriteRaw(data []byte)
 	// Flush the write write buffer and send data to the connection.
@@ -3342,7 +3325,7 @@ type HijackedConn interface {
 type redisHijackConn struct {
 	dconn redcon.DetachedConn
 	cmds  []redcon.Command
-	// anyWrap func(v interface{}) []byte
+	// anyWrap func(v any) []byte
 }
 
 func newRedisHijackedConn(dconn redcon.DetachedConn) *redisHijackConn {
@@ -3370,7 +3353,7 @@ func (conn *redisHijackConn) ReadCommands(iter func(args []string) bool) error {
 	return nil
 }
 
-func (conn *redisHijackConn) WriteAny(v interface{}) {
+func (conn *redisHijackConn) WriteAny(v any) {
 	conn.dconn.WriteAny(v)
 }
 
@@ -3452,14 +3435,14 @@ func (conn *localRedisConn) Do(args ...string) redcon.RESP {
 }
 
 type localRedconConn struct {
-	ctx  interface{}
+	ctx  any
 	out  []byte
 	conn *localRedisConn
 }
 
 func (c *localRedconConn) Close() error                   { return nil }
-func (c *localRedconConn) Context() interface{}           { return c.ctx }
-func (c *localRedconConn) SetContext(v interface{})       { c.ctx = v }
+func (c *localRedconConn) Context() any                   { return c.ctx }
+func (c *localRedconConn) SetContext(v any)               { c.ctx = v }
 func (c *localRedconConn) SetReadBuffer(n int)            {}
 func (c *localRedconConn) RemoteAddr() string             { return "" }
 func (c *localRedconConn) ReadPipeline() []redcon.Command { return nil }
@@ -3497,6 +3480,6 @@ func (c *localRedconConn) WriteNull() {
 func (c *localRedconConn) WriteRaw(data []byte) {
 	c.out = append(c.out, data...)
 }
-func (c *localRedconConn) WriteAny(v interface{}) {
+func (c *localRedconConn) WriteAny(v any) {
 	c.out = redcon.AppendAny(c.out, v)
 }
