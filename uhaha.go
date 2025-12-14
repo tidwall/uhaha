@@ -704,21 +704,74 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 	return rdata, nil
 }
 
+func detectLogStore(path string, log *redlog.Logger) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect log store: %s", err)
+	}
+	if !fi.IsDir() {
+		return "bolt"
+	}
+	data, err := os.ReadFile(filepath.Join(path, "LOGSTORE"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect log store: %s", err)
+	}
+	kind := strings.ToLower(strings.TrimSpace(string(data)))
+	switch kind {
+	case "memory", "wal":
+		return kind
+	}
+	return ""
+}
+
+func detectStableStore(path string, log *redlog.Logger) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect stable store: %s", err)
+	}
+	if !fi.IsDir() {
+		return "bolt"
+	}
+	_, err = os.ReadFile(filepath.Join(path, "stable.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect stable store: %s", err)
+	}
+	return "json"
+}
+
 func storeInit(conf Config, dir string, log *redlog.Logger,
 ) (lstore raft.LogStore, sstore raft.StableStore) {
 	var err error
 	dir = filepath.Join(dir, "store")
 
-	switch conf.Backend {
-	case Bolt:
+	// detect existing the backend
+	existingLogStore := detectLogStore(dir, log)
+	existingStableStore := detectStableStore(dir, log)
+	log.Debugf("detected store: log=%s stable=%s", existingLogStore,
+		existingStableStore)
+
+	if existingLogStore == "bolt" ||
+		(existingLogStore == "unknown" && conf.Backend == Bolt) {
 		store, err := raftboltdb.NewBoltStore(dir)
 		if err != nil {
 			log.Fatalf("bolt store open: %s", err)
 		}
 		sstore, lstore = store, store
-		log.Verbf("using log store: Bolt")
-		log.Verbf("using stable store: Bolt")
-	case LevelDB:
+		log.Printf("using store: log=bolt stable=bolt")
+	} else if existingLogStore == "leveldb" ||
+		(existingLogStore == "unknown" && conf.Backend == LevelDB) {
 		dur := raftleveldb.High
 		if conf.NoSync {
 			dur = raftleveldb.Medium
@@ -727,62 +780,38 @@ func storeInit(conf Config, dir string, log *redlog.Logger,
 		if err != nil {
 			log.Fatalf("leveldb store open: %s", err)
 		}
-		sstore, lstore = store, store
-		log.Verbf("using log store: LevelDB")
-		log.Verbf("using stable store: LevelDB")
-	case Memory:
-		lstore = newMemoryLogStore()
-		log.Verbf("using log store: Memory")
-	case WAL:
+		lstore = store
+		if existingLogStore == "leveldb" {
+			sstore = store
+			log.Printf("using store: log=leveldb stable=leveldb")
+		} else {
+			log.Printf("using store: log=leveldb stable=json")
+		}
+	} else if existingLogStore == "memory" ||
+		(existingLogStore == "unknown" && conf.Backend == Memory) {
+		lstore, err = newMemoryLogStore(dir)
+		if err != nil {
+			log.Fatalf("memory store open: %s", err)
+		}
+		log.Printf("using store: log=memory stable=json")
+	} else {
+		log.Printf("using store: log=wal stable=json")
+	}
+	if lstore == nil {
 		lstore, err = newWALLogStore(dir, conf.NoSync)
 		if err != nil {
 			log.Fatalf("wal store open: %s", err)
 		}
-		log.Verbf("using log store: WAL")
+		log.Debugf("log store: WAL")
 	}
 	if sstore == nil {
 		sstore, err = newJSONStableStore(dir)
 		if err != nil {
 			log.Fatalf("json store open: %s", err)
 		}
-		log.Verbf("using stable store: JSON")
+		log.Debugf("stable store: JSON")
 	}
 	return lstore, sstore
-
-	// lstore, err =
-
-	// switch conf.Backend {
-	// case Wal:
-	// 	lstore, err = newWalLogStore(filepath.Join(dir, "store"))
-	// 	if err != nil {
-	// 		log.Fatalf("wal store open: %s", err)
-	// 	}
-	// case Memory:
-	// 	sstore, err = newJSONStableStore(filepath.Join(dir, "store"))
-	// 	if err != nil {
-	// 		log.Fatalf("json store open: %s", err)
-	// 	}
-	// 	lstore = newMemoryLogStore()
-	// case Bolt:
-	// 	store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
-	// 	if err != nil {
-	// 		log.Fatalf("bolt store open: %s", err)
-	// 	}
-	// 	lstore store, store
-	// case LevelDB:
-	// 	dur := raftleveldb.High
-	// 	if conf.NoSync {
-	// 		dur = raftleveldb.Medium
-	// 	}
-	// 	store, err := raftleveldb.NewLevelDBStore(
-	// 		filepath.Join(dir, "store"), dur)
-	// 	if err != nil {
-	// 		log.Fatalf("leveldb store open: %s", err)
-	// 	}
-	// 	return store, store
-	// default:
-	// 	log.Fatalf("invalid backend")
-	// }
 }
 
 func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
@@ -3626,7 +3655,14 @@ type memoryLogStore struct {
 	log *btree.BTreeG[raft.Log]
 }
 
-func newMemoryLogStore() *memoryLogStore {
+func newMemoryLogStore(dir string) (*memoryLogStore, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	err := os.WriteFile(filepath.Join(dir, "LOGSTORE"), []byte("Memory"), 0600)
+	if err != nil {
+		return nil, err
+	}
 	store := new(memoryLogStore)
 	store.log = btree.NewBTreeGOptions(func(a, b raft.Log) bool {
 		return a.Index < b.Index
@@ -3634,7 +3670,7 @@ func newMemoryLogStore() *memoryLogStore {
 		Degree:  256,
 		NoLocks: true,
 	})
-	return store
+	return store, nil
 }
 
 func (store *memoryLogStore) FirstIndex() (uint64, error) {
@@ -3779,10 +3815,17 @@ type walLogStore struct {
 	log *wal.Log
 }
 
-func newWALLogStore(path string, nosync bool) (*walLogStore, error) {
+func newWALLogStore(dir string, nosync bool) (*walLogStore, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	err := os.WriteFile(filepath.Join(dir, "LOGSTORE"), []byte("WAL"), 0600)
+	if err != nil {
+		return nil, err
+	}
 	var opts wal.Options
 	opts.NoSync = nosync
-	log, err := wal.Open(path, &opts)
+	log, err := wal.Open(dir, &opts)
 	if err != nil {
 		return nil, err
 	}

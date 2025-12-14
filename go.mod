@@ -21,6 +21,7 @@ require (
 	github.com/tidwall/rtime v0.2.0
 	github.com/tidwall/sds v0.3.0
 	github.com/tidwall/sjson v1.2.5
+	github.com/tidwall/wal v1.2.1
 )
 
 require (
@@ -37,7 +38,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/tidwall/tinylru v1.1.0 // indirect
-	github.com/tidwall/wal v1.2.1 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	golang.org/x/crypto v0.46.0 // indirect
