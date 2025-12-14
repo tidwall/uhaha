@@ -32,19 +32,20 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/btree"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/match"
 	"github.com/tidwall/pretty"
-	raftleveldb "github.com/tidwall/raft-leveldb"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
 	"github.com/tidwall/sjson"
 	"github.com/tidwall/wal"
+
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
 // Main entrypoint for the cluster node. This must be called once and only
@@ -759,6 +760,7 @@ func storeInit(conf Config, dir string, log *redlog.Logger,
 	// detect existing the backend
 	existingLogStore := detectLogStore(dir, log)
 	existingStableStore := detectStableStore(dir, log)
+
 	log.Debugf("detected store: log=%s stable=%s", existingLogStore,
 		existingStableStore)
 
