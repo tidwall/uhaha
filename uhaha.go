@@ -38,13 +38,11 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/match"
 	"github.com/tidwall/pretty"
+	raftleveldb "github.com/tidwall/raft-leveldb"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
 	"github.com/tidwall/sjson"
-
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
 // Main entrypoint for the cluster node. This must be called once and only
@@ -312,6 +310,8 @@ const (
 	Bolt
 	// Memory is an in-memory database. The data is never persisted.
 	Memory
+	// Wal
+	Wal
 )
 
 func (conf *Config) def() {
@@ -411,6 +411,8 @@ func confInit(conf *Config) {
 		os.Exit(0)
 	}
 	switch backend {
+	case "wal":
+		conf.Backend = Wal
 	case "leveldb":
 		conf.Backend = LevelDB
 	case "bolt":
@@ -701,36 +703,57 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 }
 
 func storeInit(conf Config, dir string, log *redlog.Logger,
-) (raft.LogStore, raft.StableStore) {
-	switch conf.Backend {
-	case Memory:
-		jsonStore, err := newJSONStableStore(filepath.Join(dir, "store"))
-		if err != nil {
-			log.Fatalf("json store open: %s", err)
-		}
-		memStore := newMemoryLogStore()
-		return memStore, jsonStore
-	case Bolt:
-		store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
-		if err != nil {
-			log.Fatalf("bolt store open: %s", err)
-		}
-		return store, store
-	case LevelDB:
-		dur := raftleveldb.High
-		if conf.NoSync {
-			dur = raftleveldb.Medium
-		}
-		store, err := raftleveldb.NewLevelDBStore(
-			filepath.Join(dir, "store"), dur)
-		if err != nil {
-			log.Fatalf("leveldb store open: %s", err)
-		}
-		return store, store
-	default:
-		log.Fatalf("invalid backend")
+) (lstore raft.LogStore, sstore raft.StableStore) {
+	dir = filepath.Join(dir, "store")
+	var err error
+	sstore, err = newJSONStableStore(dir)
+	if err != nil {
+		log.Fatalf("json store open: %s", err)
 	}
-	return nil, nil
+	dur := raftleveldb.High
+	if conf.NoSync {
+		dur = raftleveldb.Low
+	}
+	lstore, err = raftleveldb.NewLevelDBStore(dir, dur)
+	if err != nil {
+		log.Fatalf("leveldb store open: %s", err)
+	}
+
+	// lstore, err =
+
+	// switch conf.Backend {
+	// case Wal:
+	// 	lstore, err = newWalLogStore(filepath.Join(dir, "store"))
+	// 	if err != nil {
+	// 		log.Fatalf("wal store open: %s", err)
+	// 	}
+	// case Memory:
+	// 	sstore, err = newJSONStableStore(filepath.Join(dir, "store"))
+	// 	if err != nil {
+	// 		log.Fatalf("json store open: %s", err)
+	// 	}
+	// 	lstore = newMemoryLogStore()
+	// case Bolt:
+	// 	store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
+	// 	if err != nil {
+	// 		log.Fatalf("bolt store open: %s", err)
+	// 	}
+	// 	lstore store, store
+	// case LevelDB:
+	// 	dur := raftleveldb.High
+	// 	if conf.NoSync {
+	// 		dur = raftleveldb.Medium
+	// 	}
+	// 	store, err := raftleveldb.NewLevelDBStore(
+	// 		filepath.Join(dir, "store"), dur)
+	// 	if err != nil {
+	// 		log.Fatalf("leveldb store open: %s", err)
+	// 	}
+	// 	return store, store
+	// default:
+	// 	log.Fatalf("invalid backend")
+	// }
+	return lstore, sstore
 }
 
 func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
@@ -3657,12 +3680,11 @@ func newJSONStableStore(path string) (*jsonStableStore, error) {
 func (store *jsonStableStore) Set(key []byte, val []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	var err error
-	store.json, err = sjson.Set(store.json, string(key), string(val))
+	json2, err := sjson.Set(store.json, string(key), string(val))
 	if err != nil {
 		return err
 	}
-	store.json = string(pretty.Pretty([]byte(store.json)))
+	store.json = string(pretty.Pretty([]byte(json2)))
 	err = os.MkdirAll(filepath.Join(store.path), 0700)
 	if err != nil {
 		return err
@@ -3693,3 +3715,6 @@ func (store *jsonStableStore) GetUint64(key []byte) (uint64, error) {
 	}
 	return strconv.ParseUint(string(val), 10, 64)
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// raft-wal (using https://github.com/tidwall/wal
