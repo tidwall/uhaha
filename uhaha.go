@@ -703,21 +703,23 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 }
 
 func storeInit(conf Config, dir string, log *redlog.Logger,
-) (lstore raft.LogStore, sstore raft.StableStore) {
+) (raft.LogStore, raft.StableStore) {
 	dir = filepath.Join(dir, "store")
 	var err error
-	sstore, err = newJSONStableStore(dir)
+	sstore, err := newJSONStableStore(dir)
 	if err != nil {
 		log.Fatalf("json store open: %s", err)
 	}
+	log.Verbf("using stable store: JSON")
 	dur := raftleveldb.High
 	if conf.NoSync {
-		dur = raftleveldb.Low
+		dur = raftleveldb.Medium
 	}
-	lstore, err = raftleveldb.NewLevelDBStore(dir, dur)
+	lstore, err := raftleveldb.NewLevelDBStore(dir, dur)
 	if err != nil {
 		log.Fatalf("leveldb store open: %s", err)
 	}
+	log.Verbf("using log store: LevelDB")
 
 	// lstore, err =
 
@@ -3660,6 +3662,31 @@ func (store *memoryLogStore) DeleteRange(min, max uint64) error {
 	return nil
 }
 
+func writeAtomic(path string, data []byte) (err error) {
+	var f *os.File
+	if f, err = os.Create(path + "-work"); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(path + "-work")
+		}
+	}()
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(path+"-work", path)
+}
+
+// jsonStableStore is a raft.StableStore that stores key/values in a single
+// JSON document 'stable.json'.
 type jsonStableStore struct {
 	mu   sync.Mutex
 	json string
@@ -3667,35 +3694,37 @@ type jsonStableStore struct {
 }
 
 func newJSONStableStore(path string) (*jsonStableStore, error) {
-	store := new(jsonStableStore)
-	store.path = path
-	data, err := os.ReadFile(filepath.Join(store.path, "stable.json"))
-	if err != nil && !os.IsNotExist(err) {
+	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, err
 	}
-	store.json = string(data)
+	store := new(jsonStableStore)
+	store.path = filepath.Join(path, "stable.json")
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		store.json = strings.TrimSpace(string(data))
+		if store.json == "" {
+			store.json = "{}"
+		}
+		if !gjson.Valid(store.json) {
+			return nil, errors.New("invalid json")
+		}
+		if !gjson.Parse(store.json).IsObject() {
+			return nil, errors.New("json not an object")
+		}
+	}
 	return store, nil
 }
 
 func (store *jsonStableStore) Set(key []byte, val []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	json2, err := sjson.Set(store.json, string(key), string(val))
-	if err != nil {
-		return err
-	}
+	json2, _ := sjson.Set(store.json, string(key), string(val))
 	store.json = string(pretty.Pretty([]byte(json2)))
-	err = os.MkdirAll(filepath.Join(store.path), 0700)
-	if err != nil {
-		return err
-	}
-	err = os.WriteFile(filepath.Join(store.path, "stable.json-work"),
-		[]byte(store.json), 0600)
-	if err != nil {
-		return err
-	}
-	return os.Rename(filepath.Join(store.path, "stable.json-work"),
-		filepath.Join(store.path, "stable.json"))
+	return writeAtomic(store.path, []byte(store.json))
 }
 
 func (store *jsonStableStore) Get(key []byte) ([]byte, error) {
