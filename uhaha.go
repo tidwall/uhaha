@@ -32,6 +32,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/btree"
@@ -43,6 +44,7 @@ import (
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
 	"github.com/tidwall/sjson"
+	"github.com/tidwall/wal"
 )
 
 // Main entrypoint for the cluster node. This must be called once and only
@@ -311,7 +313,7 @@ const (
 	// Memory is an in-memory database. The data is never persisted.
 	Memory
 	// Wal
-	Wal
+	WAL
 )
 
 func (conf *Config) def() {
@@ -390,7 +392,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.DataDir, "d", conf.DataDir, "")
 	flag.StringVar(&conf.JoinAddr, "j", conf.JoinAddr, "")
 	flag.StringVar(&conf.LogLevel, "l", conf.LogLevel, "")
-	flag.StringVar(&backend, "backend", "leveldb", "")
+	flag.StringVar(&backend, "backend", "wal", "")
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
 	flag.StringVar(&conf.TLSKeyPath, "tls-key", conf.TLSKeyPath, "")
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
@@ -412,7 +414,7 @@ func confInit(conf *Config) {
 	}
 	switch backend {
 	case "wal":
-		conf.Backend = Wal
+		conf.Backend = WAL
 	case "leveldb":
 		conf.Backend = LevelDB
 	case "bolt":
@@ -703,23 +705,49 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 }
 
 func storeInit(conf Config, dir string, log *redlog.Logger,
-) (raft.LogStore, raft.StableStore) {
-	dir = filepath.Join(dir, "store")
+) (lstore raft.LogStore, sstore raft.StableStore) {
 	var err error
-	sstore, err := newJSONStableStore(dir)
-	if err != nil {
-		log.Fatalf("json store open: %s", err)
+	dir = filepath.Join(dir, "store")
+
+	switch conf.Backend {
+	case Bolt:
+		store, err := raftboltdb.NewBoltStore(dir)
+		if err != nil {
+			log.Fatalf("bolt store open: %s", err)
+		}
+		sstore, lstore = store, store
+		log.Verbf("using log store: Bolt")
+		log.Verbf("using stable store: Bolt")
+	case LevelDB:
+		dur := raftleveldb.High
+		if conf.NoSync {
+			dur = raftleveldb.Medium
+		}
+		store, err := raftleveldb.NewLevelDBStore(dir, dur)
+		if err != nil {
+			log.Fatalf("leveldb store open: %s", err)
+		}
+		sstore, lstore = store, store
+		log.Verbf("using log store: LevelDB")
+		log.Verbf("using stable store: LevelDB")
+	case Memory:
+		lstore = newMemoryLogStore()
+		log.Verbf("using log store: Memory")
+	case WAL:
+		lstore, err = newWALLogStore(dir, conf.NoSync)
+		if err != nil {
+			log.Fatalf("wal store open: %s", err)
+		}
+		log.Verbf("using log store: WAL")
 	}
-	log.Verbf("using stable store: JSON")
-	dur := raftleveldb.High
-	if conf.NoSync {
-		dur = raftleveldb.Medium
+	if sstore == nil {
+		sstore, err = newJSONStableStore(dir)
+		if err != nil {
+			log.Fatalf("json store open: %s", err)
+		}
+		log.Verbf("using stable store: JSON")
 	}
-	lstore, err := raftleveldb.NewLevelDBStore(dir, dur)
-	if err != nil {
-		log.Fatalf("leveldb store open: %s", err)
-	}
-	log.Verbf("using log store: LevelDB")
+	return lstore, sstore
 
 	// lstore, err =
 
@@ -755,7 +783,6 @@ func storeInit(conf Config, dir string, log *redlog.Logger,
 	// default:
 	// 	log.Fatalf("invalid backend")
 	// }
-	return lstore, sstore
 }
 
 func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
@@ -3746,4 +3773,87 @@ func (store *jsonStableStore) GetUint64(key []byte) (uint64, error) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// raft-wal (using https://github.com/tidwall/wal
+// wal log store (using https://github.com/tidwall/wal
+
+type walLogStore struct {
+	log *wal.Log
+}
+
+func newWALLogStore(path string, nosync bool) (*walLogStore, error) {
+	var opts wal.Options
+	opts.NoSync = nosync
+	log, err := wal.Open(path, &opts)
+	if err != nil {
+		return nil, err
+	}
+	store := new(walLogStore)
+	store.log = log
+	return store, nil
+}
+
+func (store *walLogStore) FirstIndex() (uint64, error) {
+	return store.log.FirstIndex()
+}
+
+func (store *walLogStore) LastIndex() (uint64, error) {
+	return store.log.LastIndex()
+}
+
+// Decode reverses the encode operation on a byte slice input
+func decodeLog(buf []byte, log *raft.Log) error {
+	if len(buf) < 25 {
+		return ErrCorrupt
+	}
+	log.Index = binary.LittleEndian.Uint64(buf[0:8])
+	log.Term = binary.LittleEndian.Uint64(buf[8:16])
+	log.Type = raft.LogType(buf[16])
+	log.Data = make([]byte, binary.LittleEndian.Uint64(buf[17:25]))
+	if len(buf[25:]) < len(log.Data) {
+		return ErrCorrupt
+	}
+	copy(log.Data, buf[25:])
+	return nil
+}
+
+// Encode writes an encoded object to a new bytes buffer
+func appendEncodeLog(dst []byte, log *raft.Log) []byte {
+	var num [8]byte
+	binary.LittleEndian.PutUint64(num[:], log.Index)
+	dst = append(dst, num[:]...)
+	binary.LittleEndian.PutUint64(num[:], log.Term)
+	dst = append(dst, num[:]...)
+	dst = append(dst, byte(log.Type))
+	binary.LittleEndian.PutUint64(num[:], uint64(len(log.Data)))
+	dst = append(dst, num[:]...)
+	dst = append(dst, log.Data...)
+	return dst
+}
+
+func (store *walLogStore) GetLog(index uint64, log *raft.Log) error {
+	data, err := store.log.Read(index)
+	if err != nil {
+		if err == wal.ErrNotFound {
+			return raft.ErrLogNotFound
+		}
+		return err
+	}
+	return decodeLog(data, log)
+}
+
+func (store *walLogStore) StoreLog(log *raft.Log) error {
+	return store.StoreLogs([]*raft.Log{log})
+}
+
+func (store *walLogStore) StoreLogs(logs []*raft.Log) error {
+	var batch wal.Batch
+	var data []byte
+	for _, log := range logs {
+		data = appendEncodeLog(data[:0], log)
+		batch.Write(log.Index, data)
+	}
+	return store.log.WriteBatch(&batch)
+}
+
+func (store *walLogStore) DeleteRange(min, max uint64) error {
+	return store.log.TruncateFront(max + 1)
+}
