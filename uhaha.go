@@ -34,10 +34,15 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/btree"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/match"
+	"github.com/tidwall/pretty"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/redlog/v2"
 	"github.com/tidwall/rtime"
+	"github.com/tidwall/sjson"
+	"github.com/tidwall/wal"
 
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	raftleveldb "github.com/tidwall/raft-leveldb"
@@ -306,6 +311,10 @@ const (
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
 	Bolt
+	// Memory is an in-memory database. The data is never persisted.
+	Memory
+	// Wal
+	WAL
 )
 
 func (conf *Config) def() {
@@ -384,7 +393,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.DataDir, "d", conf.DataDir, "")
 	flag.StringVar(&conf.JoinAddr, "j", conf.JoinAddr, "")
 	flag.StringVar(&conf.LogLevel, "l", conf.LogLevel, "")
-	flag.StringVar(&backend, "backend", "leveldb", "")
+	flag.StringVar(&backend, "backend", "wal", "")
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
 	flag.StringVar(&conf.TLSKeyPath, "tls-key", conf.TLSKeyPath, "")
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
@@ -405,10 +414,14 @@ func confInit(conf *Config) {
 		os.Exit(0)
 	}
 	switch backend {
+	case "wal":
+		conf.Backend = WAL
 	case "leveldb":
 		conf.Backend = LevelDB
 	case "bolt":
 		conf.Backend = Bolt
+	case "memory":
+		conf.Backend = Memory
 	default:
 		fmt.Fprintf(os.Stderr, "invalid --backend: '%s'\n", backend)
 	}
@@ -692,30 +705,115 @@ func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
 	return rdata, nil
 }
 
+func detectLogStore(path string, log *redlog.Logger) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect log store: %s", err)
+	}
+	if !fi.IsDir() {
+		return "bolt"
+	}
+	data, err := os.ReadFile(filepath.Join(path, "LOGSTORE"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect log store: %s", err)
+	}
+	kind := strings.ToLower(strings.TrimSpace(string(data)))
+	switch kind {
+	case "memory", "wal":
+		return kind
+	}
+	return ""
+}
+
+func detectStableStore(path string, log *redlog.Logger) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect stable store: %s", err)
+	}
+	if !fi.IsDir() {
+		return "bolt"
+	}
+	_, err = os.ReadFile(filepath.Join(path, "stable.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "unknown"
+		}
+		log.Fatalf("detect stable store: %s", err)
+	}
+	return "json"
+}
+
 func storeInit(conf Config, dir string, log *redlog.Logger,
-) (raft.LogStore, raft.StableStore) {
-	switch conf.Backend {
-	case Bolt:
-		store, err := raftboltdb.NewBoltStore(filepath.Join(dir, "store"))
+) (lstore raft.LogStore, sstore raft.StableStore) {
+	var err error
+	dir = filepath.Join(dir, "store")
+
+	// detect existing the backend
+	existingLogStore := detectLogStore(dir, log)
+	existingStableStore := detectStableStore(dir, log)
+
+	log.Debugf("detected store: log=%s stable=%s", existingLogStore,
+		existingStableStore)
+
+	if existingLogStore == "bolt" ||
+		(existingLogStore == "unknown" && conf.Backend == Bolt) {
+		store, err := raftboltdb.NewBoltStore(dir)
 		if err != nil {
 			log.Fatalf("bolt store open: %s", err)
 		}
-		return store, store
-	case LevelDB:
+		sstore, lstore = store, store
+		log.Printf("using store: log=bolt stable=bolt")
+	} else if existingLogStore == "leveldb" ||
+		(existingLogStore == "unknown" && conf.Backend == LevelDB) {
 		dur := raftleveldb.High
 		if conf.NoSync {
 			dur = raftleveldb.Medium
 		}
-		store, err := raftleveldb.NewLevelDBStore(
-			filepath.Join(dir, "store"), dur)
+		store, err := raftleveldb.NewLevelDBStore(dir, dur)
 		if err != nil {
 			log.Fatalf("leveldb store open: %s", err)
 		}
-		return store, store
-	default:
-		log.Fatalf("invalid backend")
+		lstore = store
+		if existingLogStore == "leveldb" {
+			sstore = store
+			log.Printf("using store: log=leveldb stable=leveldb")
+		} else {
+			log.Printf("using store: log=leveldb stable=json")
+		}
+	} else if existingLogStore == "memory" ||
+		(existingLogStore == "unknown" && conf.Backend == Memory) {
+		lstore, err = newMemoryLogStore(dir)
+		if err != nil {
+			log.Fatalf("memory store open: %s", err)
+		}
+		log.Printf("using store: log=memory stable=json")
+	} else {
+		log.Printf("using store: log=wal stable=json")
 	}
-	return nil, nil
+	if lstore == nil {
+		lstore, err = newWALLogStore(dir, conf.NoSync)
+		if err != nil {
+			log.Fatalf("wal store open: %s", err)
+		}
+		log.Debugf("log store: WAL")
+	}
+	if sstore == nil {
+		sstore, err = newJSONStableStore(dir)
+		if err != nil {
+			log.Fatalf("json store open: %s", err)
+		}
+		log.Debugf("stable store: JSON")
+	}
+	return lstore, sstore
 }
 
 func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
@@ -3552,4 +3650,255 @@ func (c *localRedconConn) WriteRaw(data []byte) {
 }
 func (c *localRedconConn) WriteAny(v any) {
 	c.out = redcon.AppendAny(c.out, v)
+}
+
+type memoryLogStore struct {
+	mu  sync.Mutex
+	log *btree.BTreeG[raft.Log]
+}
+
+func newMemoryLogStore(dir string) (*memoryLogStore, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	err := os.WriteFile(filepath.Join(dir, "LOGSTORE"), []byte("Memory"), 0600)
+	if err != nil {
+		return nil, err
+	}
+	store := new(memoryLogStore)
+	store.log = btree.NewBTreeGOptions(func(a, b raft.Log) bool {
+		return a.Index < b.Index
+	}, btree.Options{
+		Degree:  256,
+		NoLocks: true,
+	})
+	return store, nil
+}
+
+func (store *memoryLogStore) FirstIndex() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	log, ok := store.log.Min()
+	if !ok {
+		return 0, nil
+	}
+	return log.Index, nil
+}
+
+func (store *memoryLogStore) LastIndex() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	log, ok := store.log.Max()
+	if !ok {
+		return 0, nil
+	}
+	return log.Index, nil
+}
+
+func (store *memoryLogStore) GetLog(index uint64, log *raft.Log) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	log0, ok := store.log.Get(raft.Log{Index: index})
+	if !ok {
+		return raft.ErrLogNotFound
+	}
+	*log = log0
+	return nil
+}
+func (store *memoryLogStore) StoreLog(log *raft.Log) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.log.Load(*log)
+	return nil
+}
+func (store *memoryLogStore) StoreLogs(logs []*raft.Log) error {
+	for _, log := range logs {
+		store.StoreLog(log)
+	}
+	return nil
+}
+func (store *memoryLogStore) DeleteRange(min, max uint64) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var opts btree.DeleteRangeOptions
+	opts.MaxInclusive = true
+	opts.NoReturn = true
+	store.log.DeleteRange(raft.Log{Index: min}, raft.Log{Index: max}, &opts)
+	return nil
+}
+
+func writeAtomic(path string, data []byte) (err error) {
+	var f *os.File
+	if f, err = os.Create(path + "-work"); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(path + "-work")
+		}
+	}()
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(path+"-work", path)
+}
+
+// jsonStableStore is a raft.StableStore that stores key/values in a single
+// JSON document 'stable.json'.
+type jsonStableStore struct {
+	mu   sync.Mutex
+	json string
+	path string
+}
+
+func newJSONStableStore(path string) (*jsonStableStore, error) {
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return nil, err
+	}
+	store := new(jsonStableStore)
+	store.path = filepath.Join(path, "stable.json")
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		store.json = strings.TrimSpace(string(data))
+		if store.json == "" {
+			store.json = "{}"
+		}
+		if !gjson.Valid(store.json) {
+			return nil, errors.New("invalid json")
+		}
+		if !gjson.Parse(store.json).IsObject() {
+			return nil, errors.New("json not an object")
+		}
+	}
+	return store, nil
+}
+
+func (store *jsonStableStore) Set(key []byte, val []byte) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	json2, _ := sjson.Set(store.json, string(key), string(val))
+	store.json = string(pretty.Pretty([]byte(json2)))
+	return writeAtomic(store.path, []byte(store.json))
+}
+
+func (store *jsonStableStore) Get(key []byte) ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return []byte(gjson.Get(store.json, string(key)).String()), nil
+}
+
+func (store *jsonStableStore) SetUint64(key []byte, val uint64) error {
+	return store.Set(key, []byte(strconv.FormatUint(val, 10)))
+}
+
+func (store *jsonStableStore) GetUint64(key []byte) (uint64, error) {
+	val, err := store.Get(key)
+	if err != nil || len(val) == 0 {
+		return 0, nil
+	}
+	return strconv.ParseUint(string(val), 10, 64)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// wal log store (using https://github.com/tidwall/wal
+
+type walLogStore struct {
+	log *wal.Log
+}
+
+func newWALLogStore(dir string, nosync bool) (*walLogStore, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	err := os.WriteFile(filepath.Join(dir, "LOGSTORE"), []byte("WAL"), 0600)
+	if err != nil {
+		return nil, err
+	}
+	var opts wal.Options
+	opts.NoSync = nosync
+	log, err := wal.Open(dir, &opts)
+	if err != nil {
+		return nil, err
+	}
+	store := new(walLogStore)
+	store.log = log
+	return store, nil
+}
+
+func (store *walLogStore) FirstIndex() (uint64, error) {
+	return store.log.FirstIndex()
+}
+
+func (store *walLogStore) LastIndex() (uint64, error) {
+	return store.log.LastIndex()
+}
+
+// Decode reverses the encode operation on a byte slice input
+func decodeLog(buf []byte, log *raft.Log) error {
+	if len(buf) < 25 {
+		return ErrCorrupt
+	}
+	log.Index = binary.LittleEndian.Uint64(buf[0:8])
+	log.Term = binary.LittleEndian.Uint64(buf[8:16])
+	log.Type = raft.LogType(buf[16])
+	log.Data = make([]byte, binary.LittleEndian.Uint64(buf[17:25]))
+	if len(buf[25:]) < len(log.Data) {
+		return ErrCorrupt
+	}
+	copy(log.Data, buf[25:])
+	return nil
+}
+
+// Encode writes an encoded object to a new bytes buffer
+func appendEncodeLog(dst []byte, log *raft.Log) []byte {
+	var num [8]byte
+	binary.LittleEndian.PutUint64(num[:], log.Index)
+	dst = append(dst, num[:]...)
+	binary.LittleEndian.PutUint64(num[:], log.Term)
+	dst = append(dst, num[:]...)
+	dst = append(dst, byte(log.Type))
+	binary.LittleEndian.PutUint64(num[:], uint64(len(log.Data)))
+	dst = append(dst, num[:]...)
+	dst = append(dst, log.Data...)
+	return dst
+}
+
+func (store *walLogStore) GetLog(index uint64, log *raft.Log) error {
+	data, err := store.log.Read(index)
+	if err != nil {
+		if err == wal.ErrNotFound {
+			return raft.ErrLogNotFound
+		}
+		return err
+	}
+	return decodeLog(data, log)
+}
+
+func (store *walLogStore) StoreLog(log *raft.Log) error {
+	return store.StoreLogs([]*raft.Log{log})
+}
+
+func (store *walLogStore) StoreLogs(logs []*raft.Log) error {
+	var batch wal.Batch
+	var data []byte
+	for _, log := range logs {
+		data = appendEncodeLog(data[:0], log)
+		batch.Write(log.Index, data)
+	}
+	return store.log.WriteBatch(&batch)
+}
+
+func (store *walLogStore) DeleteRange(min, max uint64) error {
+	return store.log.TruncateFront(max + 1)
 }
