@@ -48,6 +48,8 @@ import (
 	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
+const DebugPLSplit = false
+
 // Main entrypoint for the cluster node. This must be called once and only
 // once, and as the last call in the Go main() function. There are no return
 // values as all application operations, logging, and I/O will be forever
@@ -3300,7 +3302,7 @@ func redisCommandToArgs(cmd redcon.Command) []string {
 
 type redisQuitClose struct{}
 
-func redisServiceExecArgsOLD(s Service, client *redisClient, conn redcon.Conn,
+func redisServiceExecArgsJoin(s Service, client *redisClient, conn redcon.Conn,
 	args [][]string,
 ) {
 	sname := s.Name()
@@ -3400,7 +3402,7 @@ func redisServiceExecArgsOLD(s Service, client *redisClient, conn redcon.Conn,
 	}
 }
 
-func redisServiceExecArgsNEW(s Service, client *redisClient, conn redcon.Conn,
+func redisServiceExecArgsSplit(s Service, client *redisClient, conn redcon.Conn,
 	args0 [][]string,
 ) {
 	sname := s.Name()
@@ -3498,7 +3500,11 @@ func redisServiceExecArgsNEW(s Service, client *redisClient, conn redcon.Conn,
 func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 	args0 [][]string,
 ) {
-	redisServiceExecArgsNEW(s, client, conn, args0)
+	if DebugPLSplit {
+		redisServiceExecArgsSplit(s, client, conn, args0)
+	} else {
+		redisServiceExecArgsJoin(s, client, conn, args0)
+	}
 }
 
 func redisConnWriteAny(
