@@ -48,7 +48,7 @@ import (
 	raftleveldb "github.com/tidwall/raft-leveldb"
 )
 
-const DebugPLSplit = false
+var DebugPLSplit = false
 
 // Main entrypoint for the cluster node. This must be called once and only
 // once, and as the last call in the Go main() function. There are no return
