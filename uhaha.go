@@ -3300,7 +3300,7 @@ func redisCommandToArgs(cmd redcon.Command) []string {
 
 type redisQuitClose struct{}
 
-func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
+func redisServiceExecArgsOLD(s Service, client *redisClient, conn redcon.Conn,
 	args [][]string,
 ) {
 	sname := s.Name()
@@ -3398,6 +3398,107 @@ func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
 	if len(filteredArgs) > 0 {
 		redisServiceExecArgs(s, client, conn, filteredArgs)
 	}
+}
+
+func redisServiceExecArgsNEW(s Service, client *redisClient, conn redcon.Conn,
+	args0 [][]string,
+) {
+	sname := s.Name()
+	rfilt := s.ResponseFilter()
+	var close bool
+	for i, args := range args0 {
+		var r Receiver
+		switch args[0] {
+		case "quit":
+			r = Response(args, redisQuitClose{}, 0, nil)
+			close = true
+		case "auth":
+			if len(args) != 2 {
+				r = Response(args, nil, 0, ErrWrongNumArgs)
+			} else if err := s.Auth(args[1]); err != nil {
+				client.authorized = false
+				r = Response(args, nil, 0, err)
+			} else {
+				client.authorized = true
+				r = Response(args, redcon.SimpleString("OK"), 0, nil)
+			}
+		default:
+			if !client.authorized {
+				if err := s.Auth(""); err != nil {
+					client.authorized = false
+					r = Response(args, nil, 0, err)
+				} else {
+					client.authorized = true
+				}
+			}
+			if client.authorized {
+				switch args[0] {
+				case "ping":
+					if len(args) == 1 {
+						r = Response(args, redcon.SimpleString("PONG"), 0,
+							nil)
+					} else if len(args) == 2 {
+						r = Response(args, args[1], 0, nil)
+					} else {
+						r = Response(args, nil, 0, ErrWrongNumArgs)
+					}
+				case "shutdown":
+					s.Log().Error("Shutting down")
+					os.Exit(0)
+				case "echo":
+					if len(args) != 2 {
+						r = Response(args, nil, 0, ErrWrongNumArgs)
+					} else {
+						r = Response(args, args[1], 0, nil)
+					}
+				default:
+					r = s.Send(args, &client.opts)
+				}
+			}
+		}
+		if close {
+			break
+		}
+		resp, elapsed, err := r.Recv()
+		if err != nil {
+			if err == ErrUnknownCommand {
+				err = fmt.Errorf("%s '%s'", err, args0[i][0])
+			}
+			redisConnWriteAny(sname, rfilt, conn, client, r.Args(), err)
+		} else {
+			switch v := resp.(type) {
+			case FilterArgs:
+				var filteredArgs [][]string
+				filteredArgs = append(filteredArgs, v)
+				if len(filteredArgs) > 0 {
+					redisServiceExecArgs(s, client, conn, filteredArgs)
+				}
+			case Hijack:
+				conn := newRedisHijackedConn(conn.Detach())
+				go v(s, conn)
+			case redisQuitClose:
+				v2 := redcon.SimpleString("OK")
+				redisConnWriteAny(sname, rfilt, conn, client, r.Args(), v2)
+				conn.Close()
+			default:
+				redisConnWriteAny(sname, rfilt, conn, client, r.Args(), v)
+			}
+		}
+		// broadcast the request and response to all observers
+		s.Monitor().Send(Message{
+			Addr:    conn.RemoteAddr(),
+			Args:    args0[i],
+			Resp:    resp,
+			Err:     err,
+			Elapsed: elapsed,
+		})
+	}
+}
+
+func redisServiceExecArgs(s Service, client *redisClient, conn redcon.Conn,
+	args0 [][]string,
+) {
+	redisServiceExecArgsNEW(s, client, conn, args0)
 }
 
 func redisConnWriteAny(
