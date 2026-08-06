@@ -3599,6 +3599,8 @@ type localRedisConn struct {
 	rc *localRedconConn
 }
 
+// WriteBulkFrom write bulk from io.Reader, size n
+
 func (conn *localRedisConn) Close() {
 	conn.lc.closed(conn.rc, nil)
 }
@@ -3669,6 +3671,10 @@ func (c *localRedconConn) WriteRaw(data []byte) {
 }
 func (c *localRedconConn) WriteAny(v any) {
 	c.out = redcon.AppendAny(c.out, v)
+}
+
+func (c *localRedconConn) WriteBulkFrom(n int64, rb io.Reader) {
+	panic("unsupported")
 }
 
 type memoryLogStore struct {
