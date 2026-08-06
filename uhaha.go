@@ -223,7 +223,7 @@ type Config struct {
 	LogOutput     io.Writer     // default os.Stderr
 	LogLevel      string        // default "notice"
 	JoinAddr      string        // default ""
-	Backend       Backend       // default LevelDB
+	Backend       Backend       // default WAL
 	NoSync        bool          // default false
 	OpenReads     bool          // default false
 	MaxPool       int           // default 8
@@ -304,17 +304,17 @@ func (state State) String() string {
 type Backend int
 
 const (
+	// Wal. This is the default format used by Uhaha.
+	WAL Backend = iota
 	// LevelDB is an on-disk LSM (LSM log-structured merge-tree) database. This
 	// format is optimized for fast sequential writes, which is ideal for most
-	// Raft implementations. This is the default format used by Uhaha.
-	LevelDB Backend = iota
+	// Raft implementations.
+	LevelDB
+	// Memory is an in-memory database. The data is never persisted.
+	Memory
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
 	Bolt
-	// Memory is an in-memory database. The data is never persisted.
-	Memory
-	// Wal
-	WAL
 )
 
 func (conf *Config) def() {
@@ -384,7 +384,19 @@ func confInit(conf *Config) {
 			os.Exit(0)
 		}
 	}
+
 	var backend string
+	switch conf.Backend {
+	case WAL:
+		backend = "wal"
+	case LevelDB:
+		backend = "leveldb"
+	case Bolt:
+		backend = "bolt"
+	case Memory:
+		backend = "memory"
+	}
+
 	var testNode string
 	var vers bool
 	flag.BoolVar(&vers, "v", false, "")
@@ -393,7 +405,7 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.DataDir, "d", conf.DataDir, "")
 	flag.StringVar(&conf.JoinAddr, "j", conf.JoinAddr, "")
 	flag.StringVar(&conf.LogLevel, "l", conf.LogLevel, "")
-	flag.StringVar(&backend, "backend", "wal", "")
+	flag.StringVar(&backend, "backend", backend, "")
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
 	flag.StringVar(&conf.TLSKeyPath, "tls-key", conf.TLSKeyPath, "")
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
@@ -413,6 +425,7 @@ func confInit(conf *Config) {
 		fmt.Printf("%s\n", versline(*conf))
 		os.Exit(0)
 	}
+
 	switch backend {
 	case "wal":
 		conf.Backend = WAL
@@ -719,16 +732,22 @@ func detectLogStore(path string, log *redlog.Logger) string {
 	data, err := os.ReadFile(filepath.Join(path, "LOGSTORE"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "unknown"
+			data, err = os.ReadFile(filepath.Join(path, "CURRENT"))
+			if err == nil {
+				return "leveldb"
+			}
+			if os.IsNotExist(err) {
+				return "unknown"
+			}
 		}
 		log.Fatalf("detect log store: %s", err)
 	}
 	kind := strings.ToLower(strings.TrimSpace(string(data)))
 	switch kind {
-	case "memory", "wal":
+	case "memory", "wal", "leveldb", "bolt":
 		return kind
 	}
-	return ""
+	return "unknown"
 }
 
 func detectStableStore(path string, log *redlog.Logger) string {
