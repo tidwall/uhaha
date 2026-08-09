@@ -223,7 +223,7 @@ type Config struct {
 	LogOutput     io.Writer     // default os.Stderr
 	LogLevel      string        // default "notice"
 	JoinAddr      string        // default ""
-	Backend       Backend       // default WAL
+	Backend       Backend       // default LevelDB
 	NoSync        bool          // default false
 	OpenReads     bool          // default false
 	MaxPool       int           // default 8
@@ -234,15 +234,15 @@ type Config struct {
 	TryErrors     bool          // default false (return TRY instead of MOVED)
 	InitRunQuit   bool          // default false
 	MaxApplyBatch int           // default 256
-	Compressor    Compressor    // default Zstandard
+	Compressor    Compressor    // default Snappy
 }
 
 // Compressor is the raft stream byte compressor
 type Compressor string
 
 const (
-	Zstandard Compressor = "ZSTD" // Zstandard
-	Snappy    Compressor = "SNAP" // Snappy
+	Snappy    Compressor = "SNAP" // Snappy (Default)
+	Zstandard Compressor = "ZSTD" // Zstandard (Experimental)
 	Raw       Compressor = "RAW0" // No compression
 )
 
@@ -304,17 +304,17 @@ func (state State) String() string {
 type Backend int
 
 const (
-	// Wal. This is the default format used by Uhaha.
-	WAL Backend = iota
 	// LevelDB is an on-disk LSM (LSM log-structured merge-tree) database. This
 	// format is optimized for fast sequential writes, which is ideal for most
-	// Raft implementations.
-	LevelDB
-	// Memory is an in-memory database. The data is never persisted.
-	Memory
+	// Raft implementations. This is the default format used by Uhaha.
+	LevelDB Backend = iota
 	// Bolt is an on-disk single-file b+tree database. This format has been a
 	// popular choice for Go-based Raft implementations for years.
 	Bolt
+	// Memory is an in-memory database. The data is never persisted.
+	Memory
+	// Wal (Experimental)
+	WAL
 )
 
 func (conf *Config) def() {
@@ -349,7 +349,7 @@ func (conf *Config) def() {
 		conf.MaxApplyBatch = 256
 	}
 	if !conf.Compressor.known() {
-		conf.Compressor = Zstandard
+		conf.Compressor = Snappy
 	}
 }
 
