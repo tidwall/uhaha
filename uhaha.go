@@ -111,8 +111,14 @@ Advanced options:
                      to faster write operations but opens up the chance for data
                      loss due to catastrophic events such as power failure.
 {{END_NOSYNC}}
+{{BEGIN_OPENREADS}}
   --openreads      : allow followers to process read commands, but with the 
                      possibility of returning stale data.
+{{END_OPENREADS}}
+{{BEGIN_NOOPENREADS}}
+  --noopenreads    : do not allow followers to process read commands. This
+                     guarantees no stale data for reads.
+{{END_NOOPENREADS}}
   --localtime      : have the raft machine time synchronized with the local
                      server rather than the public internet. This will run the 
                      risk of time shifts when the local server time is
@@ -379,6 +385,16 @@ func keepUsageSecion(key string, s string) string {
 	return s
 }
 
+func flagIsSet(name string) bool {
+	ok := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			ok = true
+		}
+	})
+	return ok
+}
+
 func confInit(conf *Config) {
 	conf.def()
 	if conf.Flag.Custom {
@@ -397,8 +413,15 @@ func confInit(conf *Config) {
 			s = keepUsageSecion("SYNC", s)
 			s = deleteUsageSecion("NOSYNC", s)
 		} else {
-			s = keepUsageSecion("NOSYNC", s)
 			s = deleteUsageSecion("SYNC", s)
+			s = keepUsageSecion("NOSYNC", s)
+		}
+		if conf.OpenReads {
+			s = keepUsageSecion("NOOPENREADS", s)
+			s = deleteUsageSecion("OPENREADS", s)
+		} else {
+			s = deleteUsageSecion("NOOPENREADS", s)
+			s = keepUsageSecion("OPENREADS", s)
 		}
 		s = strings.ReplaceAll(s, "{{VERSION}}", conf.Version)
 		if conf.GitSHA == "" {
@@ -432,6 +455,8 @@ func confInit(conf *Config) {
 
 	var testNode string
 	var vers bool
+	var sync bool
+	var noopenreads bool
 	flag.BoolVar(&vers, "v", false, "")
 	flag.StringVar(&conf.Addr, "a", conf.Addr, "")
 	flag.StringVar(&conf.NodeID, "n", conf.NodeID, "")
@@ -442,7 +467,9 @@ func confInit(conf *Config) {
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
 	flag.StringVar(&conf.TLSKeyPath, "tls-key", conf.TLSKeyPath, "")
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
+	flag.BoolVar(&sync, "sync", false, "")
 	flag.BoolVar(&conf.OpenReads, "openreads", conf.OpenReads, "")
+	flag.BoolVar(&noopenreads, "noopenreads", false, "")
 	flag.StringVar(&conf.BackupPath, "restore", conf.BackupPath, "")
 	flag.BoolVar(&conf.LocalTime, "localtime", conf.LocalTime, "")
 	flag.StringVar(&conf.Auth, "auth", conf.Auth, "")
@@ -457,6 +484,14 @@ func confInit(conf *Config) {
 	if vers {
 		fmt.Printf("%s\n", versline(*conf))
 		os.Exit(0)
+	}
+
+	if flagIsSet("sync") {
+		conf.NoSync = !sync
+	}
+
+	if flagIsSet("noopenreads") {
+		conf.OpenReads = !noopenreads
 	}
 
 	switch backend {
@@ -664,6 +699,27 @@ func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
 		conf.LogReady(log)
 	}
 	log.Warningf("starting %s", versline(conf))
+
+	cfgmsg := ""
+	if conf.OpenReads {
+		cfgmsg += "openreads, "
+	} else {
+		cfgmsg += "noopenreads, "
+	}
+	if conf.NoSync {
+		cfgmsg += "nosync, "
+	} else {
+		cfgmsg += "sync, "
+	}
+	if conf.LocalTime {
+		cfgmsg += "localtime, "
+	} else {
+		cfgmsg += "remotetime, "
+	}
+	if cfgmsg != "" {
+		log.Printf("features: %s", cfgmsg[:len(cfgmsg)-2])
+	}
+
 	return hclog.New(&hclopts), log
 }
 
