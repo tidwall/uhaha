@@ -101,9 +101,16 @@ Networking options:
   --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
+{{BEGIN_SYNC}}
+  --sync           : turn on syncing data to disk after every write. This leads
+                     to slower write operations but ensures data is recoverable
+                     due to catastrophic events such as power failure.
+{{END_SYNC}}
+{{BEGIN_NOSYNC}}
   --nosync         : turn off syncing data to disk after every write. This leads
                      to faster write operations but opens up the chance for data
                      loss due to catastrophic events such as power failure.
+{{END_NOSYNC}}
   --openreads      : allow followers to process read commands, but with the 
                      possibility of returning stale data.
   --localtime      : have the raft machine time synchronized with the local
@@ -353,6 +360,25 @@ func (conf *Config) def() {
 	}
 }
 
+func deleteUsageSecion(key string, s string) string {
+	bkey := "{{BEGIN_" + key + "}}\n"
+	ekey := "{{END_" + key + "}}\n"
+	i := strings.Index(s, bkey)
+	j := strings.Index(s, ekey)
+	if i == -1 || j < i {
+		return s
+	}
+	return s[:i] + s[j+len(ekey):]
+}
+
+func keepUsageSecion(key string, s string) string {
+	bkey := "{{BEGIN_" + key + "}}\n"
+	ekey := "{{END_" + key + "}}\n"
+	s = strings.ReplaceAll(s, bkey, "")
+	s = strings.ReplaceAll(s, ekey, "")
+	return s
+}
+
 func confInit(conf *Config) {
 	conf.def()
 	if conf.Flag.Custom {
@@ -367,18 +393,25 @@ func confInit(conf *Config) {
 			}
 		}
 		s := usage
-		s = strings.Replace(s, "{{VERSION}}", conf.Version, -1)
-		if conf.GitSHA == "" {
-			s = strings.Replace(s, " ({{GITSHA}})", "", -1)
-			s = strings.Replace(s, "{{GITSHA}}", "", -1)
+		if conf.NoSync {
+			s = keepUsageSecion("SYNC", s)
+			s = deleteUsageSecion("NOSYNC", s)
 		} else {
-			s = strings.Replace(s, "{{GITSHA}}", conf.GitSHA, -1)
+			s = keepUsageSecion("NOSYNC", s)
+			s = deleteUsageSecion("SYNC", s)
 		}
-		s = strings.Replace(s, "{{NAME}}", conf.Name, -1)
+		s = strings.ReplaceAll(s, "{{VERSION}}", conf.Version)
+		if conf.GitSHA == "" {
+			s = strings.ReplaceAll(s, " ({{GITSHA}})", "")
+			s = strings.ReplaceAll(s, "{{GITSHA}}", "")
+		} else {
+			s = strings.ReplaceAll(s, "{{GITSHA}}", conf.GitSHA)
+		}
+		s = strings.ReplaceAll(s, "{{NAME}}", conf.Name)
 		if conf.Flag.Usage != nil {
 			s = conf.Flag.Usage(s)
 		}
-		s = strings.Replace(s, "{{USAGE}}", "", -1)
+		s = strings.ReplaceAll(s, "{{USAGE}}", "")
 		w.Write([]byte(s))
 		if w == os.Stdout {
 			os.Exit(0)
