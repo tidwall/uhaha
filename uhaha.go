@@ -75,6 +75,7 @@ func Main(conf Config) {
 	go runWriteApplier(conf, m, ra)
 	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
 	go runTicker(conf, tm, m, ra, log)
+	go runPromotionWatcher(ra)
 
 	log.Fatal(svr.serve())
 }
@@ -89,7 +90,7 @@ Basic options:
   -a addr          : bind to address  (default: 127.0.0.1:11001)
   -n id            : node ID  (default: 1)
   -d dir           : data directory  (default: data)
-  -j addr          : leader address of a cluster to join
+  -j addr          : join a cluster using the leader address
   -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
@@ -101,6 +102,9 @@ Networking options:
   --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
+  --nonvoter       : when used with the -j flag this server will be added as a
+                     non-voter. This flag is ignored for servers that have
+                     already been added to a cluster.
 {{BEGIN_SYNC}}
   --sync           : turn on syncing data to disk after every write. This leads
                      to slower write operations but ensures data is recoverable
@@ -139,6 +143,7 @@ type Config struct {
 	services  []serviceEntry     // appended by AddService
 	jsonType  reflect.Type       // used by UseJSONSnapshots
 	jsonSnaps bool               // used by UseJSONSnapshots
+	nonvoter  bool               // server should not be a voter upon joining
 
 	// Name gives the server application a name. Default "uhaha-app"
 	Name string
@@ -469,6 +474,7 @@ func confInit(conf *Config) {
 	flag.BoolVar(&conf.NoSync, "nosync", conf.NoSync, "")
 	flag.BoolVar(&sync, "sync", false, "")
 	flag.BoolVar(&conf.OpenReads, "openreads", conf.OpenReads, "")
+	flag.BoolVar(&conf.nonvoter, "nonvoter", false, "")
 	flag.BoolVar(&noopenreads, "noopenreads", false, "")
 	flag.StringVar(&conf.BackupPath, "restore", conf.BackupPath, "")
 	flag.BoolVar(&conf.LocalTime, "localtime", conf.LocalTime, "")
@@ -1143,7 +1149,12 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 		} else {
 			// Joining an existing cluster
 			joinAddr := conf.JoinAddr
-			log.Noticef("joining existing cluster at %v", joinAddr)
+			sufferage := "voter"
+			if conf.nonvoter {
+				sufferage = "non-voter"
+			}
+			log.Noticef("joining existing cluster at %v as %s", joinAddr,
+				sufferage)
 			err := func() error {
 				for {
 					conn, err := RedisDial(joinAddr, conf.Auth, tlscfg)
@@ -1152,7 +1163,7 @@ func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
 					}
 					defer conn.Close()
 					res, err := redis.String(conn.Do("raft", "server", "add",
-						conf.NodeID, addrStr))
+						conf.NodeID, addrStr, sufferage))
 					if err != nil {
 						if strings.HasPrefix(err.Error(), "MOVED ") {
 							parts := strings.Split(err.Error(), " ")
@@ -1276,6 +1287,8 @@ type raftWrap struct {
 	advertise string
 	mu        sync.RWMutex
 	extra     map[string]serverExtra
+	sufmu     sync.Mutex
+	suf       raft.ServerSuffrage // do not access, call Voter() instead
 }
 
 func (ra *raftWrap) getExtraForAddr(addr string) (extra serverExtra, ok bool) {
@@ -1298,6 +1311,7 @@ type serverEntry struct {
 	address string
 	resolve string
 	leader  bool
+	voter   bool
 }
 
 func (e *serverEntry) clusterID() string {
@@ -1342,6 +1356,7 @@ func (ra *raftWrap) getServerList() ([]serverEntry, error) {
 			entry.resolve = entry.address
 		}
 		entry.leader = entry.resolve == leader || entry.address == leader
+		entry.voter = s.Suffrage == raft.Voter
 		servers = append(servers, entry)
 	}
 	return servers, nil
@@ -2481,8 +2496,8 @@ func cmdRAFTSERVER(um Machine, ra *raftWrap, args []string) (any, error) {
 		return cmdRAFTSERVERLIST(m, ra, args)
 	case "add":
 		return cmdRAFTSERVERADD(m, ra, args)
-	case "remove":
-		return cmdRAFTSERVERREMOVE(m, ra, args)
+	case "remove", "promote", "demote":
+		return cmdRAFTSERVERACTION(m, ra, args)
 	default:
 		return nil, fmt.Errorf("unknown raft command '%s', try RAFT HELP",
 			args[1])
@@ -2505,18 +2520,44 @@ func cmdRAFTSERVERLIST(m *machine, ra *raftWrap, args []string) (any, error) {
 			"id", s.id,
 			"address", s.address,
 			"leader", fmt.Sprint(s.leader),
+			"voter", fmt.Sprint(s.voter),
 		})
 	}
 	return res, nil
 }
 
-// RAFT SERVER REMOVE id
+// RAFT SERVER (REMOVE|PROMOTE|DEMOTE) id
 // help: removes a server from the cluster; bool
-func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string) (any, error) {
+func cmdRAFTSERVERACTION(m *machine, ra *raftWrap, args []string) (any, error) {
 	if len(args) != 4 {
 		return nil, errWrongNumArgsRaft
 	}
-	f := ra.RemoveServer(raft.ServerID(string(args[3])), 0, 0)
+	id := raft.ServerID(string(args[3]))
+	var f raft.IndexFuture
+	switch strings.ToLower(string(args[2])) {
+	case "remove":
+		f = ra.RemoveServer(id, 0, 0)
+	case "demote":
+		f = ra.DemoteVoter(id, 0, 0)
+	case "promote":
+		cf := ra.GetConfiguration()
+		if err := cf.Error(); err != nil {
+			return nil, fmt.Errorf("could not get configuration: %s", err)
+		}
+		var addr raft.ServerAddress
+		for _, server := range cf.Configuration().Servers {
+			if server.ID == id {
+				addr = server.Address
+				break
+			}
+		}
+		if addr == "" {
+			return nil, fmt.Errorf("server not found")
+		}
+		f = ra.AddVoter(id, addr, 0, 0)
+	default:
+		return nil, ErrSyntax
+	}
 	err := f.Error()
 	if err != nil {
 		return nil, errRaftConvert(ra, err)
@@ -2524,41 +2565,59 @@ func cmdRAFTSERVERREMOVE(m *machine, ra *raftWrap, args []string) (any, error) {
 	return true, nil
 }
 
-// RAFT SERVER ADD id address
+// RAFT SERVER ADD id address [NONVOTER]
 // help: Returns true if server added, or error; bool
 func cmdRAFTSERVERADD(m *machine, ra *raftWrap, args []string) (any, error) {
-	if len(args) != 5 {
+	if len(args) < 5 {
 		return nil, errWrongNumArgsRaft
 	}
-	err := ra.AddVoter(raft.ServerID(args[3]), raft.ServerAddress(args[4]),
-		0, 0).Error()
-	if err != nil {
+	voter := true
+	for i := 5; i < len(args); i++ {
+		switch strings.ToLower(args[i]) {
+		case "nonvoter", "non-voter":
+			voter = false
+		case "voter":
+			voter = true
+		default:
+			return nil, ErrSyntax
+		}
+	}
+	id := raft.ServerID(args[3])
+	addr := raft.ServerAddress(args[4])
+	var fut raft.IndexFuture
+	if voter {
+		fut = ra.AddVoter(id, addr, 0, 0)
+	} else {
+		fut = ra.AddNonvoter(id, addr, 0, 0)
+	}
+	if err := fut.Error(); err != nil {
 		return nil, errRaftConvert(ra, err)
 	}
 	return true, nil
 }
 
-// RAFT INFO [pattern]
+// RAFT INFO [pattern ...]
 // help: returns various raft related info; map[string]string
 func cmdRAFTINFO(um Machine, ra *raftWrap, args []string) (any, error) {
 	m := getBaseMachine(um)
 	if m == nil {
 		return nil, ErrInvalid
 	}
-	pattern := "*"
-	switch len(args) {
-	case 2:
-	case 3:
-		pattern = args[2]
-	default:
-		return nil, errWrongNumArgsRaft
+	var patterns []string
+	if len(args) > 2 {
+		patterns = args[2:]
 	}
-	if pattern == "state" {
-		// Fast path to avoid locks. Under the hood there's only a single
-		// atomic load
-		return []string{"state", ra.State().String()}, nil
+	if len(patterns) == 1 {
+		// Fast path to avoid locks.
+		switch patterns[0] {
+		case "voter":
+			return []string{"voter", fmt.Sprint(ra.Voter())}, nil
+		case "state":
+			return []string{"state", ra.State().String()}, nil
+		case "id":
+			return []string{"id", ra.conf.NodeID}, nil
+		}
 	}
-
 	stats := ra.Stats()
 	m.mu.RLock()
 	behind := m.logRemain
@@ -2566,10 +2625,18 @@ func cmdRAFTINFO(um Machine, ra *raftWrap, args []string) (any, error) {
 	m.mu.RUnlock()
 	stats["logs_behind"] = fmt.Sprint(behind)
 	stats["logs_loaded_percent"] = fmt.Sprintf("%0.1f", percent*100)
+	stats["voter"] = fmt.Sprint(ra.Voter())
+	stats["id"] = ra.conf.NodeID
+	if len(patterns) == 0 {
+		return stats, nil
+	}
 	final := make(map[string]string)
 	for key, value := range stats {
-		if match.Match(key, pattern) {
-			final[key] = value
+		for i := 0; i < len(patterns); i++ {
+			if match.Match(key, patterns[i]) {
+				final[key] = value
+				break
+			}
 		}
 	}
 	return final, nil
@@ -2890,11 +2957,13 @@ func cmdRAFTHELP(um Machine, ra *raftWrap, args []string) (any, error) {
 	}
 	lines := []redcon.SimpleString{
 		"RAFT LEADER",
-		"RAFT INFO [pattern]",
+		"RAFT INFO [pattern ...]",
 
 		"RAFT SERVER LIST",
-		"RAFT SERVER ADD id address",
+		"RAFT SERVER ADD id address [NONVOTER]",
 		"RAFT SERVER REMOVE id",
+		"RAFT SERVER PROMOTE id",
+		"RAFT SERVER DEMOTE id",
 
 		"RAFT SNAPSHOT NOW",
 		"RAFT SNAPSHOT LIST",
@@ -4015,4 +4084,38 @@ func (store *walLogStore) StoreLogs(logs []*raft.Log) error {
 
 func (store *walLogStore) DeleteRange(min, max uint64) error {
 	return store.log.TruncateFront(max + 1)
+}
+
+func runPromotionWatcher(ra *raftWrap) {
+	ra.sufmu.Lock()
+	var suffrage raft.ServerSuffrage = -1
+loop:
+	for {
+		id := raft.ServerID(ra.conf.NodeID)
+		f := ra.GetConfiguration()
+		if err := f.Error(); err == nil {
+			for _, s := range f.Configuration().Servers {
+				if s.ID == id {
+					if s.Suffrage != suffrage {
+						if suffrage != -1 {
+							ra.sufmu.Lock()
+						}
+						ra.suf = s.Suffrage
+						ra.sufmu.Unlock()
+						suffrage = s.Suffrage
+					}
+					time.Sleep(time.Second / 4)
+					continue loop
+				}
+			}
+		}
+		time.Sleep(time.Second / 20)
+	}
+}
+
+func (ra *raftWrap) Voter() bool {
+	ra.sufmu.Lock()
+	s := ra.suf.String()
+	ra.sufmu.Unlock()
+	return s == "Voter"
 }
