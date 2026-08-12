@@ -88,9 +88,10 @@ Basic options:
   -v               : display version
   -h               : display help, this screen
   -a addr          : bind to address  (default: 127.0.0.1:11001)
+{{BEGIN_NODEID}}
   -n id            : node ID  (default: 1)
+{{END_NODEID}}
   -d dir           : data directory  (default: data)
-  -j addr          : join a cluster using the leader address
   -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
@@ -99,12 +100,14 @@ Security options:
   --auth auth      : cluster authorization, shared by all servers and clients
 
 Networking options: 
+  --join addr      : join a cluster using the leader address. This flag is 
+                     ignored if server has already been added to a cluster.
   --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
-  --nonvoter       : when used with the -j flag this server will be added as a
-                     non-voter. This flag is ignored for servers that have
-                     already been added to a cluster.
+  --nonvoter       : when used with the --join flag this server will be added as
+                     a non-voter. This flag is ignored if server has already
+                     been added to a cluster.
 {{BEGIN_SYNC}}
   --sync           : turn on syncing data to disk after every write. This leads
                      to slower write operations but ensures data is recoverable
@@ -144,6 +147,7 @@ type Config struct {
 	jsonType  reflect.Type       // used by UseJSONSnapshots
 	jsonSnaps bool               // used by UseJSONSnapshots
 	nonvoter  bool               // server should not be a voter upon joining
+	testnode  string             // set when the -t flag is used
 
 	// Name gives the server application a name. Default "uhaha-app"
 	Name string
@@ -257,6 +261,7 @@ type Config struct {
 	InitRunQuit   bool          // default false
 	MaxApplyBatch int           // default 256
 	Compressor    Compressor    // default Snappy
+	FlatDirAutoID bool          // default false (uses flat dir/id structure)
 }
 
 // Compressor is the raft stream byte compressor
@@ -418,6 +423,12 @@ func confInit(conf *Config) {
 			}
 		}
 		s := usage
+		if conf.FlatDirAutoID {
+			s = deleteUsageSecion("NODEID", s)
+		} else {
+			s = keepUsageSecion("NODEID", s)
+		}
+
 		if conf.NoSync {
 			s = keepUsageSecion("SYNC", s)
 			s = deleteUsageSecion("NOSYNC", s)
@@ -462,15 +473,17 @@ func confInit(conf *Config) {
 		backend = "memory"
 	}
 
-	var testNode string
 	var vers bool
 	var sync bool
 	var noopenreads bool
 	flag.BoolVar(&vers, "v", false, "")
 	flag.StringVar(&conf.Addr, "a", conf.Addr, "")
-	flag.StringVar(&conf.NodeID, "n", conf.NodeID, "")
+	if !conf.FlatDirAutoID {
+		flag.StringVar(&conf.NodeID, "n", conf.NodeID, "")
+	}
 	flag.StringVar(&conf.DataDir, "d", conf.DataDir, "")
 	flag.StringVar(&conf.JoinAddr, "j", conf.JoinAddr, "")
+	flag.StringVar(&conf.JoinAddr, "join", conf.JoinAddr, "")
 	flag.StringVar(&conf.LogLevel, "l", conf.LogLevel, "")
 	flag.StringVar(&backend, "backend", backend, "")
 	flag.StringVar(&conf.TLSCertPath, "tls-cert", conf.TLSCertPath, "")
@@ -484,7 +497,7 @@ func confInit(conf *Config) {
 	flag.BoolVar(&conf.LocalTime, "localtime", conf.LocalTime, "")
 	flag.StringVar(&conf.Auth, "auth", conf.Auth, "")
 	flag.StringVar(&conf.Advertise, "advertise", conf.Advertise, "")
-	flag.StringVar(&testNode, "t", "", "")
+	flag.StringVar(&conf.testnode, "t", "", "")
 	flag.BoolVar(&conf.TryErrors, "try-errors", conf.TryErrors, "")
 	flag.BoolVar(&conf.InitRunQuit, "init-run-quit", conf.InitRunQuit, "")
 	if conf.Flag.PreParse != nil {
@@ -516,15 +529,15 @@ func confInit(conf *Config) {
 	default:
 		fmt.Fprintf(os.Stderr, "invalid --backend: '%s'\n", backend)
 	}
-	switch testNode {
+	switch conf.testnode {
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		if conf.Addr == "" {
-			conf.Addr = ":1100" + testNode
+			conf.Addr = ":1100" + conf.testnode
 		} else {
-			conf.Addr = conf.Addr[:len(conf.Addr)-1] + testNode
+			conf.Addr = conf.Addr[:len(conf.Addr)-1] + conf.testnode
 		}
-		conf.NodeID = testNode
-		if testNode != "1" {
+		conf.NodeID = conf.testnode
+		if conf.testnode != "1" {
 			conf.JoinAddr = conf.Addr[:len(conf.Addr)-1] + "1"
 		}
 	case "":
@@ -746,6 +759,25 @@ func stateChangeFilter(line string, log *redlog.Logger) string {
 	return line
 }
 
+func readConfig(dir string) ([]byte, error) {
+	json, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	json = bytes.TrimSpace(json)
+	if len(json) == 0 {
+		json = []byte("{}")
+	}
+	if !gjson.ValidBytes(json) {
+		return nil, errors.New("invalid json")
+	}
+	return json, nil
+}
+func writeConfig(dir string, json []byte) error {
+	json = pretty.Pretty(json)
+	return os.WriteFile(filepath.Join(dir, "config.json"), json, 0600)
+}
+
 type restoreData struct {
 	data  any
 	ts    int64
@@ -755,11 +787,39 @@ type restoreData struct {
 
 func dataDirInit(conf Config, log *redlog.Logger) (string, *restoreData) {
 	var rdata *restoreData
-	name := conf.DataDirAppName
-	if name == "" {
-		name = conf.Name
+	dir := conf.DataDir
+	if conf.FlatDirAutoID {
+		if conf.testnode != "" {
+			dir = filepath.Join(dir, conf.testnode)
+		}
+		if err := os.MkdirAll(dir, 0777); err != nil {
+			log.Fatal(err)
+		}
+		json, err := readConfig(dir)
+		if err != nil {
+			log.Fatal("config.json: ", err)
+		}
+		conf.NodeID = gjson.GetBytes(json, "node_id").String()
+		if conf.NodeID == "" {
+			conf.NodeID = genNodeID()
+			json, _ = sjson.SetBytes(json, "node_id", conf.NodeID)
+			err := writeConfig(dir, json)
+			if err != nil {
+				log.Fatal("config.json: ", err)
+			}
+		}
+		if !validNodeID(conf.NodeID) {
+			log.Fatal("config.json: invalid node id")
+		}
+
+	} else {
+		name := conf.DataDirAppName
+		if name == "" {
+			name = conf.Name
+		}
+		dir = filepath.Join(dir, name, conf.NodeID)
 	}
-	dir := filepath.Join(conf.DataDir, name, conf.NodeID)
+
 	if conf.BackupPath != "" {
 		_, err := os.Stat(dir)
 		if err == nil {
@@ -784,6 +844,9 @@ func dataDirInit(conf Config, log *redlog.Logger) (string, *restoreData) {
 	if conf.DataDirReady != nil {
 		conf.DataDirReady(dir)
 	}
+
+	log.Printf("node: %s", conf.NodeID)
+
 	return dir, rdata
 }
 
@@ -2270,6 +2333,34 @@ func (m *machine) UUID() string {
 	buf[18] = '-'
 	buf[23] = '-'
 	return string(buf[:])
+}
+
+func genNodeID() string {
+	var buf [9]byte
+	rand.Read(buf[:4])
+	binary.BigEndian.PutUint32(buf[5:], uint32(time.Now().Unix()))
+	for i := range len(buf) {
+		buf[i] = hexchars[buf[i]&15]
+	}
+	buf[4] = '-'
+	return string(buf[:])
+}
+
+func validNodeIDChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' || c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '-' || c == '_'
+}
+
+func validNodeID(id string) bool {
+	if len(id) == 0 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if !validNodeIDChar(id[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *machine) Int() int {

@@ -271,7 +271,6 @@ Basic options:
   -a addr          : bind to address  (default: 127.0.0.1:11001)
   -n id            : node ID  (default: 1)
   -d dir           : data directory  (default: data)
-  -j addr          : join a cluster using the leader address
   -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
@@ -283,9 +282,11 @@ Networking options:
   --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
-  --nonvoter       : when used with the -j flag this server will be added as a
-                     non-voter. This flag is ignored for servers that have
-                     already been added to a cluster.
+  --join addr      : join a cluster using the leader address. This flag is 
+                     ignored if server has already been added to a cluster.
+  --nonvoter       : when used with the --join flag this server will be added as
+                     a non-voter. This flag is ignored if server has already
+                     been added to a cluster.
   --nosync         : turn off syncing data to disk after every write. This leads
                      to faster write operations but opens up the chance for data
                      loss due to catastrophic events such as power failure.
