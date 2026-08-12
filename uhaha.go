@@ -197,6 +197,10 @@ type Config struct {
 	// path to the directory where all the logs and snapshots are stored.
 	DataDirReady func(dir string)
 
+	// DataDirAppName is an optional directory name of the application.
+	// Default is Config.Name
+	DataDirAppName string
+
 	// LogReady is an optional callback function that fires when the logger has
 	// been initialized. The logger is can be safely used concurrently.
 	LogReady func(log Logger)
@@ -751,7 +755,11 @@ type restoreData struct {
 
 func dataDirInit(conf Config, log *redlog.Logger) (string, *restoreData) {
 	var rdata *restoreData
-	dir := filepath.Join(conf.DataDir, conf.Name, conf.NodeID)
+	name := conf.DataDirAppName
+	if name == "" {
+		name = conf.Name
+	}
+	dir := filepath.Join(conf.DataDir, name, conf.NodeID)
 	if conf.BackupPath != "" {
 		_, err := os.Stat(dir)
 		if err == nil {
