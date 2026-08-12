@@ -1,5 +1,5 @@
 <p align="center">
-	<img src="logo.png" border=0 width=500 alt="uhaha">
+	<img src="/.github/images/logo.png" border=0 width=500 alt="uhaha">
 </p>
 <p align="center">
 <a href="https://godoc.org/github.com/tidwall/uhaha"><img src="https://img.shields.io/badge/api-reference-blue.svg?style=flat-square" alt="GoDoc"></a>
