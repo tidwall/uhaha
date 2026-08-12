@@ -56,25 +56,25 @@ func Main(conf Config) {
 	confInit(&conf)
 	conf.AddService(redisService())
 
-	hclogger, log := logInit(conf)
-	tm := remoteTimeInit(conf, log)
-	dir, data := dataDirInit(conf, log)
-	m := machineInit(conf, dir, data, log)
-	tlscfg := tlsInit(conf, log)
-	svr, addr := serverInit(conf, tlscfg, log)
-	trans := transportInit(conf, tlscfg, svr, hclogger, log)
-	lstore, sstore := storeInit(conf, dir, log)
-	snaps := snapshotInit(conf, dir, m, hclogger, log)
-	ra := raftInit(conf, hclogger, m, lstore, sstore, snaps, trans, log)
+	hclogger, log := logInit(&conf)
+	tm := remoteTimeInit(&conf, log)
+	dir, data := dataDirInit(&conf, log)
+	m := machineInit(&conf, dir, data, log)
+	tlscfg := tlsInit(&conf, log)
+	svr, addr := serverInit(&conf, tlscfg, log)
+	trans := transportInit(&conf, tlscfg, svr, hclogger, log)
+	lstore, sstore := storeInit(&conf, dir, log)
+	snaps := snapshotInit(&conf, dir, m, hclogger, log)
+	ra := raftInit(&conf, hclogger, m, lstore, sstore, snaps, trans, log)
 
-	printExtraLogInfo(conf, log)
-	joinClusterIfNeeded(conf, ra, addr, tlscfg, log)
-	startUserServices(conf, svr, m, ra, log)
+	printExtraLogInfo(&conf, log)
+	joinClusterIfNeeded(&conf, ra, addr, tlscfg, log)
+	startUserServices(&conf, svr, m, ra, log)
 
 	go runMaintainServers(ra)
-	go runWriteApplier(conf, m, ra)
-	go runLogLoadedPoller(conf, m, ra, tlscfg, log)
-	go runTicker(conf, tm, m, ra, log)
+	go runWriteApplier(&conf, m, ra)
+	go runLogLoadedPoller(&conf, m, ra, tlscfg, log)
+	go runTicker(&conf, tm, m, ra, log)
 	go runPromotionWatcher(ra)
 
 	log.Fatal(svr.serve())
@@ -505,7 +505,7 @@ func confInit(conf *Config) {
 	}
 	flag.Parse()
 	if vers {
-		fmt.Printf("%s\n", versline(*conf))
+		fmt.Printf("%s\n", versline(conf))
 		os.Exit(0)
 	}
 
@@ -679,7 +679,7 @@ func jsonRestore(rd io.Reader, typ reflect.Type) (any, error) {
 	return data, err
 }
 
-func versline(conf Config) string {
+func versline(conf *Config) string {
 	sha := ""
 	if conf.GitSHA != "" {
 		sha = " (" + conf.GitSHA + ")"
@@ -687,7 +687,7 @@ func versline(conf Config) string {
 	return fmt.Sprintf("%s version %s%s", conf.Name, conf.Version, sha)
 }
 
-func logInit(conf Config) (hclog.Logger, *redlog.Logger) {
+func logInit(conf *Config) (hclog.Logger, *redlog.Logger) {
 	var log *redlog.Logger
 	logLevel := conf.LogLevel
 	wr := conf.LogOutput
@@ -785,7 +785,7 @@ type restoreData struct {
 	start int64
 }
 
-func dataDirInit(conf Config, log *redlog.Logger) (string, *restoreData) {
+func dataDirInit(conf *Config, log *redlog.Logger) (string, *restoreData) {
 	var rdata *restoreData
 	dir := conf.DataDir
 	if conf.FlatDirAutoID {
@@ -850,7 +850,7 @@ func dataDirInit(conf Config, log *redlog.Logger) (string, *restoreData) {
 	return dir, rdata
 }
 
-func dataDirRestoreBackup(conf Config, dir string, log *redlog.Logger,
+func dataDirRestoreBackup(conf *Config, dir string, log *redlog.Logger,
 ) (rdata *restoreData, err error) {
 	rdata = new(restoreData)
 	f, err := os.Open(conf.BackupPath)
@@ -937,7 +937,7 @@ func detectStableStore(path string, log *redlog.Logger) string {
 	return "json"
 }
 
-func storeInit(conf Config, dir string, log *redlog.Logger,
+func storeInit(conf *Config, dir string, log *redlog.Logger,
 ) (lstore raft.LogStore, sstore raft.StableStore) {
 	var err error
 	dir = filepath.Join(dir, "store")
@@ -1001,7 +1001,7 @@ func storeInit(conf Config, dir string, log *redlog.Logger,
 	return lstore, sstore
 }
 
-func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
+func snapshotInit(conf *Config, dir string, m *machine, hclogger hclog.Logger,
 	log *redlog.Logger,
 ) raft.SnapshotStore {
 	snaps, err := raft.NewFileSnapshotStoreWithLogger(dir, 3, hclogger)
@@ -1012,7 +1012,7 @@ func snapshotInit(conf Config, dir string, m *machine, hclogger hclog.Logger,
 	return snaps
 }
 
-func machineInit(conf Config, dir string, rdata *restoreData,
+func machineInit(conf *Config, dir string, rdata *restoreData,
 	log *redlog.Logger,
 ) *machine {
 	m := new(machine)
@@ -1082,13 +1082,13 @@ func (rt *remoteTime) Now() time.Time {
 	return ctime
 }
 
-func printExtraLogInfo(conf Config, log *redlog.Logger) {
+func printExtraLogInfo(conf *Config, log *redlog.Logger) {
 	log.Debugf("using compressor: %s", conf.Compressor)
 }
 
 // remoteTimeInit initializes the remote time fetching services, and
 // continueously runs it in the background to keep synchronized.
-func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
+func remoteTimeInit(conf *Config, log *redlog.Logger) *remoteTime {
 	rt := new(remoteTime)
 	if conf.LocalTime {
 		log.Warning("using local time")
@@ -1136,7 +1136,7 @@ func remoteTimeInit(conf Config, log *redlog.Logger) *remoteTime {
 	return rt
 }
 
-func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
+func raftInit(conf *Config, hclogger hclog.Logger, fsm raft.FSM,
 	logStore raft.LogStore, stableStore raft.StableStore,
 	snaps raft.SnapshotStore, trans raft.Transport, log *redlog.Logger,
 ) *raftWrap {
@@ -1181,7 +1181,7 @@ func raftInit(conf Config, hclogger hclog.Logger, fsm raft.FSM,
 // joinClusterIfNeeded attempts to make this server join a Raft cluster. If
 // the server already belongs to a cluster or if the server is bootstrapping
 // then this operation is ignored.
-func joinClusterIfNeeded(conf Config, ra *raftWrap, addr net.Addr,
+func joinClusterIfNeeded(conf *Config, ra *raftWrap, addr net.Addr,
 	tlscfg *tls.Config, log *redlog.Logger,
 ) {
 	// Get the current Raft cluster configuration for determining whether this
@@ -1315,7 +1315,7 @@ func RedisDial(addr, auth string, tlscfg *tls.Config) (redis.Conn, error) {
 	return conn, nil
 }
 
-func startUserServices(conf Config, svr *splitServer, m *machine, ra *raftWrap,
+func startUserServices(conf *Config, svr *splitServer, m *machine, ra *raftWrap,
 	log *redlog.Logger,
 ) {
 	// rearrange so that services with nil sniffers are last
@@ -1354,7 +1354,7 @@ type serverExtra struct {
 
 type raftWrap struct {
 	*raft.Raft
-	conf      Config
+	conf      *Config
 	advertise string
 	mu        sync.RWMutex
 	extra     map[string]serverExtra
@@ -1552,7 +1552,7 @@ func autoEncode(compressor Compressor, data []byte) []byte {
 // runWriteApplier is a background routine that handles all write requests.
 // It's job is to apply the request to the Raft log and returns the result to
 // writeRequest.
-func runWriteApplier(conf Config, m *machine, ra *raftWrap) {
+func runWriteApplier(conf *Config, m *machine, ra *raftWrap) {
 	var maxReqs = conf.MaxApplyBatch
 	for {
 		// Gather up as many requests (up to 256) into a single list.
@@ -1647,7 +1647,7 @@ func getClusterLastIndex(ra *raftWrap, tlscfg *tls.Config, auth string,
 
 // runLogLoadedPoller is a background routine that reports on raft log progress
 // and also maintains the m.logLoaded atomic boolean for open read systems.
-func runLogLoadedPoller(conf Config, m *machine, ra *raftWrap,
+func runLogLoadedPoller(conf *Config, m *machine, ra *raftWrap,
 	tlscfg *tls.Config, log *redlog.Logger,
 ) {
 	var loaded bool
@@ -1709,7 +1709,7 @@ func runLogLoadedPoller(conf Config, m *machine, ra *raftWrap,
 
 // runTicker is a background routine that keeps the raft machine time and
 // random seed updated.
-func runTicker(conf Config, rt *remoteTime, m *machine, ra *raftWrap,
+func runTicker(conf *Config, rt *remoteTime, m *machine, ra *raftWrap,
 	log *redlog.Logger,
 ) {
 	rbuf := make([]byte, 4096)
@@ -1793,7 +1793,7 @@ func (s *transportStream) Dial(addr raft.ServerAddress, timeout time.Duration,
 	return conn, nil
 }
 
-func transportInit(conf Config, tlscfg *tls.Config, svr *splitServer,
+func transportInit(conf *Config, tlscfg *tls.Config, svr *splitServer,
 	hclogger hclog.Logger, log *redlog.Logger,
 ) raft.Transport {
 	ln := svr.split(func(r io.Reader) (n int, ok bool) {
@@ -1819,7 +1819,7 @@ func transportInit(conf Config, tlscfg *tls.Config, svr *splitServer,
 	return raft.NewNetworkTransport(stream, conf.MaxPool, 0, log)
 }
 
-func serverInit(conf Config, tlscfg *tls.Config, log *redlog.Logger,
+func serverInit(conf *Config, tlscfg *tls.Config, log *redlog.Logger,
 ) (*splitServer, net.Addr) {
 	var ln net.Listener
 	var err error
@@ -1862,7 +1862,7 @@ func parseTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	return tlscfg, nil
 }
 
-func tlsInit(conf Config, log *redlog.Logger) *tls.Config {
+func tlsInit(conf *Config, log *redlog.Logger) *tls.Config {
 	if conf.TLSCertPath == "" || conf.TLSKeyPath == "" {
 		return nil
 	}
