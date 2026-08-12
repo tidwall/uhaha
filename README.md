@@ -150,10 +150,12 @@ There are a number built-in commands for managing and monitor the cluster.
 VERSION                                 # show the application version
 MACHINE                                 # show information about the state machine
 RAFT LEADER                             # show the address of the current raft leader
-RAFT INFO [pattern]                     # show information about the raft server and cluster
+RAFT INFO [pattern ...]                 # show information about the raft server and cluster
 RAFT SERVER LIST                        # show all servers in cluster
-RAFT SERVER ADD id address              # add a server to cluster
+RAFT SERVER ADD id address [NONVOTER]   # add a server to cluster
 RAFT SERVER REMOVE id                   # remove a server from the cluster
+RAFT SERVER PROMOTE id                  # promote a server from non-voter to voter
+RAFT SERVER DEMOTE id                   # demote a server from voter to non-voter
 RAFT SNAPSHOT NOW                       # make a snapshot of the data
 RAFT SNAPSHOT LIST                      # show a list of all snapshots on server
 RAFT SNAPSHOT FILE id                   # show the file path of a snapshot on server
@@ -258,7 +260,7 @@ redis-cli -h 10.0.0.1 -p 11001 --tls --cacert rootCA.pem -a my-secret
 
 ## Command-line options
 
-Below are all of the command line options.
+Below are the primary command line options.
 
 ```
 Usage: my-uhaha-app [-n id] [-a addr] [options]
@@ -269,7 +271,7 @@ Basic options:
   -a addr          : bind to address  (default: 127.0.0.1:11001)
   -n id            : node ID  (default: 1)
   -d dir           : data directory  (default: data)
-  -j addr          : leader address of a cluster to join
+  -j addr          : join a cluster using the leader address
   -l level         : log level  (default: info) [debug,verb,info,warn,silent]
 
 Security options:
@@ -281,6 +283,9 @@ Networking options:
   --advertise addr : advertise address  (default: network bound address)
 
 Advanced options:
+  --nonvoter       : when used with the -j flag this server will be added as a
+                     non-voter. This flag is ignored for servers that have
+                     already been added to a cluster.
   --nosync         : turn off syncing data to disk after every write. This leads
                      to faster write operations but opens up the chance for data
                      loss due to catastrophic events such as power failure.
@@ -296,8 +301,3 @@ Advanced options:
                      operation is ignored when a data directory already exists.
                      Cannot be used with -j flag.
 ```
-
-
-
-
-
